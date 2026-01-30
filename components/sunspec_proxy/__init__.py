@@ -75,6 +75,10 @@ CONF_SENSOR_TCP_REQUESTS = "tcp_requests"
 CONF_SENSOR_TCP_ERRORS = "tcp_errors"
 CONF_SENSOR_VICTRON_CONNECTED = "victron_connected"
 CONF_SENSOR_POWER_LIMIT = "power_limit"
+CONF_SENSOR_DTU_SERIAL = "dtu_serial"
+CONF_SENSOR_DTU_ONLINE = "dtu_online"
+CONF_SENSOR_DTU_POLL_SUCCESS = "dtu_poll_success"
+CONF_SENSOR_DTU_POLL_FAIL = "dtu_poll_fail"
 
 sunspec_proxy_ns = cg.esphome_ns.namespace("sunspec_proxy")
 SunSpecProxy = sunspec_proxy_ns.class_("SunSpecProxy", cg.Component, uart.UARTDevice)
@@ -156,6 +160,10 @@ BRIDGE_SENSORS_SCHEMA = cv.Schema(
         cv.Optional(CONF_SENSOR_TCP_ERRORS, default=True): cv.boolean,
         cv.Optional(CONF_SENSOR_VICTRON_CONNECTED, default=True): cv.boolean,
         cv.Optional(CONF_SENSOR_POWER_LIMIT, default=True): cv.boolean,
+        cv.Optional(CONF_SENSOR_DTU_SERIAL, default=True): cv.boolean,
+        cv.Optional(CONF_SENSOR_DTU_ONLINE, default=True): cv.boolean,
+        cv.Optional(CONF_SENSOR_DTU_POLL_SUCCESS, default=True): cv.boolean,
+        cv.Optional(CONF_SENSOR_DTU_POLL_FAIL, default=True): cv.boolean,
     }
 )
 
@@ -455,3 +463,20 @@ async def to_code(config):
     if bridge_config.get(CONF_SENSOR_POWER_LIMIT, True):
         sens = await _create_sensor("Power Limit", UNIT_PERCENT, 1, None, None, "mdi:speedometer")
         cg.add(var.set_power_limit_sensor(sens))
+
+    # DTU diagnostic sensors
+    if bridge_config.get(CONF_SENSOR_DTU_SERIAL, True):
+        tsens = await _create_text_sensor("DTU Serial", "mdi:identifier", ENTITY_CATEGORY_DIAGNOSTIC)
+        cg.add(var.set_dtu_serial_sensor(tsens))
+
+    if bridge_config.get(CONF_SENSOR_DTU_ONLINE, True):
+        bsens = await _create_binary_sensor("DTU Online", DEVICE_CLASS_CONNECTIVITY)
+        cg.add(var.set_dtu_online_sensor(bsens))
+
+    if bridge_config.get(CONF_SENSOR_DTU_POLL_SUCCESS, True):
+        sens = await _create_sensor("DTU Poll Success", None, 0, None, None, "mdi:check-circle", ENTITY_CATEGORY_DIAGNOSTIC)
+        cg.add(var.set_dtu_poll_ok_sensor(sens))
+
+    if bridge_config.get(CONF_SENSOR_DTU_POLL_FAIL, True):
+        sens = await _create_sensor("DTU Poll Failures", None, 0, None, None, "mdi:alert-circle", ENTITY_CATEGORY_DIAGNOSTIC)
+        cg.add(var.set_dtu_poll_fail_sensor(sens))

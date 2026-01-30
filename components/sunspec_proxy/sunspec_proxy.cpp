@@ -239,106 +239,44 @@ void SunSpecProxy::aggregate_and_update_registers_() {
   int valid_count = 0;
   bool any_producing = false;
 
+  // FIXED: Use decoded float values from sources instead of reading raw_regs as SunSpec
   for (int i = 0; i < num_sources_; i++) {
     auto &s = sources_[i];
     if (!s.data_valid) continue;
     valid_count++;
 
-    uint16_t *r = s.raw_regs;
-    int16_t a_sf   = (int16_t)r[INV_A_SF];
-    int16_t v_sf   = (int16_t)r[INV_V_SF];
-    int16_t w_sf   = (int16_t)r[INV_W_SF];
-    int16_t hz_sf  = (int16_t)r[INV_Hz_SF];
-    int16_t va_sf  = (int16_t)r[INV_VA_SF];
-    int16_t var_sf = (int16_t)r[INV_VAr_SF];
-    int16_t wh_sf  = (int16_t)r[INV_WH_SF];
-    int16_t dc_w_sf = (int16_t)r[INV_DCW_SF];
-    int16_t tmp_sf = (int16_t)r[INV_Tmp_SF];
+    // Use the already-decoded values from the Hoymiles data
+    total_power += s.power_w;
+    total_current += s.current_a;
+    if (s.power_w > 0) any_producing = true;
+    sum_freq += s.frequency_hz;
 
-    // Total power from this source
-    float pw = apply_sf((int16_t)r[INV_W], w_sf);
-    if (!std::isnan(pw)) { total_power += pw; s.power_w = pw; if (pw > 0) any_producing = true; }
-    else s.power_w = 0;
-
-    // Total current from this source
-    float cur = apply_sf_u16(r[INV_A], a_sf);
-    if (!std::isnan(cur)) { total_current += cur; s.current_a = cur; } else s.current_a = 0;
-
-    // Phase-aware current and voltage distribution
-    if (s.phases == 3) {
-      // 3-phase source: per-phase data comes directly from registers
-      float i_a = apply_sf_u16(r[INV_AphA], a_sf);
-      float i_b = apply_sf_u16(r[INV_AphB], a_sf);
-      float i_c = apply_sf_u16(r[INV_AphC], a_sf);
-      if (!std::isnan(i_a)) phase_current[0] += i_a;
-      if (!std::isnan(i_b)) phase_current[1] += i_b;
-      if (!std::isnan(i_c)) phase_current[2] += i_c;
-
-      float v_a = apply_sf_u16(r[INV_PhVphA], v_sf);
-      float v_b = apply_sf_u16(r[INV_PhVphB], v_sf);
-      float v_c = apply_sf_u16(r[INV_PhVphC], v_sf);
-      if (!std::isnan(v_a)) { phase_voltage_sum[0] += v_a; phase_voltage_count[0]++; }
-      if (!std::isnan(v_b)) { phase_voltage_sum[1] += v_b; phase_voltage_count[1]++; }
-      if (!std::isnan(v_c)) { phase_voltage_sum[2] += v_c; phase_voltage_count[2]++; }
-
-      // Distribute power across phases (use per-phase current ratio if available)
-      float total_i = (std::isnan(i_a) ? 0 : i_a) + (std::isnan(i_b) ? 0 : i_b) + (std::isnan(i_c) ? 0 : i_c);
-      if (total_i > 0 && !std::isnan(pw)) {
-        phase_power[0] += pw * (std::isnan(i_a) ? 0 : i_a) / total_i;
-        phase_power[1] += pw * (std::isnan(i_b) ? 0 : i_b) / total_i;
-        phase_power[2] += pw * (std::isnan(i_c) ? 0 : i_c) / total_i;
-      } else if (!std::isnan(pw)) {
-        // Equal split if no per-phase current
-        phase_power[0] += pw / 3.0f;
-        phase_power[1] += pw / 3.0f;
-        phase_power[2] += pw / 3.0f;
-      }
-
-      s.voltage_v = std::isnan(v_a) ? 0 : v_a; // report phase A for the source sensor
-
-    } else {
-      // Single-phase source: all output goes to connected_phase
-      int ph = s.connected_phase - 1; // 0-indexed (0=L1, 1=L2, 2=L3)
-      if (ph < 0 || ph > 2) ph = 0;
-
-      float i_a = apply_sf_u16(r[INV_AphA], a_sf);
-      if (std::isnan(i_a)) i_a = cur; // fallback to total current
-      if (!std::isnan(i_a)) phase_current[ph] += i_a;
-
-      float v_a = apply_sf_u16(r[INV_PhVphA], v_sf);
-      if (!std::isnan(v_a)) { phase_voltage_sum[ph] += v_a; phase_voltage_count[ph]++; s.voltage_v = v_a; }
-      else s.voltage_v = 0;
-
-      if (!std::isnan(pw)) phase_power[ph] += pw;
-    }
-
-    // VA / VAr (total, not per-phase)
-    float va = apply_sf((int16_t)r[INV_VA], va_sf);
-    if (!std::isnan(va)) total_va += va;
-    float var_ = apply_sf((int16_t)r[INV_VAr], var_sf);
-    if (!std::isnan(var_)) total_var += var_;
-
-    // Frequency (averaged)
-    float freq = apply_sf((int16_t)r[INV_Hz], hz_sf);
-    if (!std::isnan(freq)) { sum_freq += freq; s.frequency_hz = freq; } else s.frequency_hz = 0;
-
-    // Energy: acc32
-    uint32_t e_raw = ((uint32_t)r[INV_WH] << 16) | r[INV_WH + 1];
-    float e_mult = powf(10.0f, (float)wh_sf);
-    uint32_t e_wh = (uint32_t)((float)e_raw * e_mult);
-    total_energy_wh += e_wh;
-    s.energy_kwh = (float)e_wh / 1000.0f;
+    // Total energy in Wh from kWh
+    total_energy_wh += (uint32_t)(s.energy_kwh * 1000.0f);
 
     // Temperature
-    float temp = apply_sf((int16_t)r[INV_TmpCab], tmp_sf);
-    if (!std::isnan(temp)) {
-      s.temperature_c = temp;
-      if (std::isnan(max_temp) || temp > max_temp) max_temp = temp;
+    if (std::isnan(max_temp) || s.temperature_c > max_temp)
+      max_temp = s.temperature_c;
+
+    // Phase distribution
+    if (s.phases == 3) {
+      // 3-phase: distribute evenly (we only have total values from Hoymiles)
+      for (int p = 0; p < 3; p++) {
+        phase_current[p] += s.current_a / 3.0f;
+        phase_voltage_sum[p] += s.voltage_v;
+        phase_voltage_count[p]++;
+      }
+    } else {
+      // Single-phase: add to connected_phase
+      int ph = s.connected_phase - 1;  // 0-indexed (0=L1, 1=L2, 2=L3)
+      if (ph < 0 || ph > 2) ph = 0;
+      phase_current[ph] += s.current_a;
+      phase_voltage_sum[ph] += s.voltage_v;
+      phase_voltage_count[ph]++;
     }
 
-    // DC power
-    float dcp = apply_sf((int16_t)r[INV_DCW], dc_w_sf);
-    if (!std::isnan(dcp)) total_dc_power += dcp;
+    // DC power (approximate from PV power)
+    total_dc_power += s.pv_power_w;
 
     s.producing = (s.power_w > 0);
     update_source_status_(i);
@@ -530,6 +468,21 @@ void SunSpecProxy::publish_tcp_sensors_() {
     uint16_t pct = register_map_[OFF_M123 + 2 + 5]; // WMaxLimPct
     uint16_t ena = register_map_[OFF_M123 + 2 + 8]; // WMaxLim_Ena
     power_limit_sensor_->publish_state(ena == 1 ? pct / 10.0f : 100.0f);
+  }
+
+  // DTU diagnostics
+  if (dtu_serial_sensor_ && dtu_serial_[0] != 0) {
+    dtu_serial_sensor_->publish_state(dtu_serial_);
+  }
+  if (dtu_poll_ok_sensor_) {
+    dtu_poll_ok_sensor_->publish_state(dtu_poll_count_);
+  }
+  if (dtu_poll_fail_sensor_) {
+    dtu_poll_fail_sensor_->publish_state(dtu_poll_fail_count_);
+  }
+  if (dtu_online_sensor_) {
+    bool dtu_online = dtu_poll_count_ > 0 && (millis() - last_dtu_poll_ok_ms_) < 30000;
+    dtu_online_sensor_->publish_state(dtu_online);
   }
 }
 
@@ -828,24 +781,32 @@ void SunSpecProxy::forward_power_limit_(uint16_t pct_raw, bool enabled) {
 // ============================================================
 // 
 // The DTU-Pro is polled at dtu_address_ using Hoymiles Modbus registers:
-// - Register 0x1000 + (port * 0x28) = Data for inverter at that port
-// - Each port block is 40 registers (0x28 = 40 decimal)
+// - Data registers: 0x1000 + (port * 20 regs) = FC 0x03 Read Holding Registers
+// - Status registers: 0xC000+ = FC 0x01/0x02 Read Coils/Discrete Inputs (NOT FC 0x03!)
+// - DTU serial: 0x2000 for 3 registers = FC 0x03
 // 
-// Register layout per port (offset from port base):
-//   0x00: Data type
-//   0x01-0x06: Serial number (6 regs = 12 chars)
-//   0x07: Port number
-//   0x08: PV Voltage (V)
-//   0x09: PV Current (A * 2)
-//   0x0A: Grid Voltage (V)
-//   0x0B: Grid Frequency (Hz * 100)
-//   0x0C: PV Power (W)
-//   0x0D-0x0E: Today Production (Wh, 32-bit)
-//   0x0F-0x10: Total Production (Wh, 32-bit)
-//   0x11: Temperature (°C)
-//   0x1E: Operating Status
-//   0x1F: Alarm Code
-//   0x20: Link Status
+// Per-port data layout (FC 0x03 from 0x1000 + port*20, read 20 registers):
+// NOTE: Hoymiles spec uses BYTE addresses; Modbus uses REGISTER addresses.
+// Register offsets below are derived from spec byte addresses / 2.
+// 
+// Offset | Field            | Spec Byte Addr | Scaling (decimal places)
+// -------|------------------|----------------|-------------------------
+//   0    | Data Type        | 0x1000-0x1001  | -
+//   0-3  | Serial (6 bytes) | 0x1001-0x1006  | -
+//   3    | Port Number      | 0x1007         | -
+//   4    | PV Voltage       | 0x1008-0x1009  | 1 (×0.1 → V)
+//   5    | PV Current       | 0x100A-0x100B  | 2 for HM (×0.01 → A)
+//   6    | Grid Voltage     | 0x100C-0x100D  | 1 (×0.1 → V)
+//   7    | Grid Frequency   | 0x100E-0x100F  | 2 (×0.01 → Hz)
+//   8    | PV Power         | 0x1010-0x1011  | 1 (×0.1 → W)
+//   9    | Today Prod       | 0x1012-0x1013  | none (raw Wh)
+//  10-11 | Total Prod       | 0x1014-0x1017  | none (uint32 Wh)
+//  12    | Temperature      | 0x1018-0x1019  | 1 (×0.1 → °C, signed)
+//  13    | Operating Status | 0x101A-0x101B  | -
+//  14    | Alarm Code       | 0x101C-0x101D  | -
+//  15    | Alarm Count      | 0x101E-0x101F  | -
+//  16    | Link Status      | 0x1020-0x1021  | high byte only
+// 17-19  | Reserved         | 0x1022-0x1027  | -
 
 void SunSpecProxy::poll_rtu_sources_() {
   if (num_sources_ == 0) return;
@@ -857,6 +818,53 @@ void SunSpecProxy::poll_rtu_sources_() {
     int n = read_rtu_response_(resp, sizeof(resp));
 
     if (n > 0) {
+      // Check if this is a DTU serial read response (phase -1)
+      if (current_poll_phase_ == -1) {
+        if (n >= 5 && resp[1] == 0x03) {
+          uint8_t byte_count = resp[2];
+          int reg_count = byte_count / 2;
+          
+          if (reg_count >= HM_DTU_SN_REGS) {
+            // Extract DTU serial number: 3 registers = 6 bytes
+            uint16_t reg_data[HM_DTU_SN_REGS];
+            for (int i = 0; i < HM_DTU_SN_REGS; i++) {
+              reg_data[i] = be16(&resp[3 + i * 2]);
+            }
+            
+            // Convert to hex string
+            uint8_t sn_bytes[6];
+            sn_bytes[0] = (reg_data[0] >> 8) & 0xFF;
+            sn_bytes[1] = reg_data[0] & 0xFF;
+            sn_bytes[2] = (reg_data[1] >> 8) & 0xFF;
+            sn_bytes[3] = reg_data[1] & 0xFF;
+            sn_bytes[4] = (reg_data[2] >> 8) & 0xFF;
+            sn_bytes[5] = reg_data[2] & 0xFF;
+            
+            for (int j = 0; j < 6; j++) {
+              snprintf(&dtu_serial_[j*2], 3, "%02x", sn_bytes[j]);
+            }
+            dtu_serial_[12] = 0;
+            
+            dtu_serial_read_ = true;
+            dtu_poll_count_++;
+            last_dtu_poll_ok_ms_ = now;
+            
+            ESP_LOGI(TAG, "DTU: Serial number: %s (poll OK count: %lu)", dtu_serial_, dtu_poll_count_);
+          } else {
+            ESP_LOGW(TAG, "DTU: Short serial response: %d regs (need %d)", reg_count, HM_DTU_SN_REGS);
+            dtu_poll_fail_count_++;
+          }
+        } else if (n >= 2 && (resp[1] & 0x80)) {
+          uint8_t exc = n >= 3 ? resp[2] : 0;
+          ESP_LOGW(TAG, "DTU: Exception response for serial read: func=0x%02X exc=%d", resp[1], exc);
+          dtu_poll_fail_count_++;
+        }
+        rtu_busy_ = false;
+        current_poll_phase_ = 0;  // Move to inverter polling
+        return;
+      }
+
+      // Otherwise, this is an inverter data response
       auto &s = sources_[current_poll_source_];
 
       if (n >= 5 && resp[1] == 0x03) {
@@ -867,20 +875,29 @@ void SunSpecProxy::poll_rtu_sources_() {
           reg_data[i] = be16(&resp[3 + i * 2]);
         }
 
-        // Parse Hoymiles data registers
-        if (reg_count >= 34) {  // Need at least up to 0x21 (34 regs)
-          // Extract serial number from regs 0x01-0x06 (6 regs = 12 digits)
+        // Parse Hoymiles data registers with CORRECTED offsets and scaling
+        if (reg_count >= 17) {  // Need at least up to HM_LINK_STATUS (0x10 = 17 regs minimum)
+          // Extract serial number: bytes 1-6 span regs 0-3
+          // Reg 0: [data_type(u8)][sn_byte_0]
+          // Reg 1: [sn_byte_1][sn_byte_2]
+          // Reg 2: [sn_byte_3][sn_byte_4]
+          // Reg 3: [sn_byte_5][port_number(u8)]
           if (!s.initial_model1_read) {
-            char sn[13] = {0};
-            for (int i = 0; i < 6 && (1 + i) < reg_count; i++) {
-              sn[i * 2]     = (reg_data[1 + i] >> 8) & 0xFF;
-              sn[i * 2 + 1] = reg_data[1 + i] & 0xFF;
+            uint8_t sn_bytes[6];
+            sn_bytes[0] = reg_data[HM_DATA_TYPE_SN] & 0xFF;           // low byte of reg 0
+            sn_bytes[1] = (reg_data[HM_SN_REG1] >> 8) & 0xFF;         // high byte of reg 1
+            sn_bytes[2] = reg_data[HM_SN_REG1] & 0xFF;                // low byte of reg 1
+            sn_bytes[3] = (reg_data[HM_SN_REG1 + 1] >> 8) & 0xFF;     // high byte of reg 2
+            sn_bytes[4] = reg_data[HM_SN_REG1 + 1] & 0xFF;            // low byte of reg 2
+            sn_bytes[5] = (reg_data[HM_SN_PORT] >> 8) & 0xFF;         // high byte of reg 3
+            
+            // Convert to hex string (like Python's hexlify)
+            char sn[13];
+            for (int j = 0; j < 6; j++) {
+              snprintf(&sn[j*2], 3, "%02x", sn_bytes[j]);
             }
             sn[12] = 0;
-            // Trim trailing nulls/spaces
-            for (int i = 11; i >= 0; i--) {
-              if (sn[i] == 0 || sn[i] == ' ') sn[i] = 0; else break;
-            }
+            
             if (sn[0] != 0) {
               strncpy(s.serial_from_dtu, sn, 32);
               if (s.serial_number[0] == 0) {
@@ -891,24 +908,31 @@ void SunSpecProxy::poll_rtu_sources_() {
             s.initial_model1_read = true;
           }
 
-          // Parse live data
-          s.pv_voltage_v = (float)reg_data[HM_PV_VOLTAGE];
-          s.pv_current_a = (float)reg_data[HM_PV_CURRENT] / 2.0f;  // Scaled by 2
-          s.voltage_v = (float)reg_data[HM_GRID_VOLTAGE];
-          s.frequency_hz = (float)reg_data[HM_GRID_FREQ] / 100.0f;  // Scaled by 100
-          s.pv_power_w = (float)reg_data[HM_PV_POWER];
-          s.power_w = s.pv_power_w;  // For AC output, use PV power (micro-inverter)
+          // Parse live data with CORRECT Hoymiles scaling factors
+          // Spec's "decimal" column: 1 decimal place = ×0.1, 2 decimal places = ×0.01
+          s.pv_voltage_v = (float)reg_data[HM_PV_VOLTAGE] * 0.1f;         // decimal=1 → ×0.1 → V
+          // NOTE: PV Current scaling varies by model: HM/HMS = decimal 2 (×0.01), MI = decimal 1 (×0.1)
+          // TODO: Auto-detect model or make configurable if MI series support is needed
+          s.pv_current_a = (float)reg_data[HM_PV_CURRENT] * 0.01f;        // decimal=2 (HM/HMS) → ×0.01 → A
+          s.voltage_v = (float)reg_data[HM_GRID_VOLTAGE] * 0.1f;          // decimal=1 → ×0.1 → V
+          s.frequency_hz = (float)reg_data[HM_GRID_FREQ] * 0.01f;         // decimal=2 → ×0.01 → Hz
+          s.pv_power_w = (float)reg_data[HM_PV_POWER] * 0.1f;             // decimal=1 → ×0.1 → W
+          s.power_w = s.pv_power_w;  // Microinverter: AC output ≈ PV power
           
-          // 32-bit values (high word first in Hoymiles format)
-          uint32_t today_wh = ((uint32_t)reg_data[HM_TODAY_PROD_H] << 16) | reg_data[HM_TODAY_PROD_L];
+          // Today production: single uint16, raw Wh (NO scaling)
+          s.today_energy_wh = (float)reg_data[HM_TODAY_PROD];
+          
+          // Total production: uint32, raw Wh (NO scaling, high word first)
           uint32_t total_wh = ((uint32_t)reg_data[HM_TOTAL_PROD_H] << 16) | reg_data[HM_TOTAL_PROD_L];
-          s.today_energy_wh = (float)today_wh;
           s.energy_kwh = (float)total_wh / 1000.0f;
           
-          s.temperature_c = (float)(int16_t)reg_data[HM_TEMPERATURE];
+          // Temperature: int16, ×0.1 → °C
+          s.temperature_c = (float)(int16_t)reg_data[HM_TEMPERATURE] * 0.1f;
+          
           s.operating_status = reg_data[HM_OPERATING_STATUS];
           s.alarm_code = reg_data[HM_ALARM_CODE];
-          s.link_status = reg_data[HM_LINK_STATUS] & 0xFF;
+          s.alarm_count = reg_data[HM_ALARM_COUNT];
+          s.link_status = (reg_data[HM_LINK_STATUS] >> 8) & 0xFF;  // High byte only
           s.producing = (s.power_w > 0);
 
           // Estimate AC current from power/voltage
@@ -920,13 +944,24 @@ void SunSpecProxy::poll_rtu_sources_() {
           s.last_poll_ms = now;
           s.poll_success_count++;
 
-          ESP_LOGD(TAG, "RTU RX: '%s' (port %d) — P=%.0fW, V=%.0fV, I=%.2fA, F=%.2fHz, T=%.0f°C, E=%.1fkWh",
-                   s.name, s.port_number, s.power_w, s.voltage_v, s.current_a, 
-                   s.frequency_hz, s.temperature_c, s.energy_kwh);
+          // DEBUG logging with hex dump of first few regs
+          ESP_LOGD(TAG, "RTU RX: '%s' (port %d) — P=%.0fW (PV: %.1fV/%.2fA=%.0fW), Grid: %.0fV/%.2fHz, T=%.1f°C, Today=%.0fWh, Total=%.1fkWh, Status=0x%04X, Alarm=%d/%d, Link=0x%02X",
+                   s.name, s.port_number, s.power_w, 
+                   s.pv_voltage_v, s.pv_current_a, s.pv_power_w,
+                   s.voltage_v, s.frequency_hz, s.temperature_c,
+                   s.today_energy_wh, s.energy_kwh,
+                   s.operating_status, s.alarm_code, s.alarm_count, s.link_status);
+          
+          // Extra verbose hex dump for first 10 regs for debugging
+          if (reg_count >= 10) {
+            ESP_LOGV(TAG, "  RAW regs 0-9: %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X",
+                     reg_data[0], reg_data[1], reg_data[2], reg_data[3], reg_data[4],
+                     reg_data[5], reg_data[6], reg_data[7], reg_data[8], reg_data[9]);
+          }
 
           aggregate_and_update_registers_();
         } else {
-          ESP_LOGW(TAG, "RTU RX: Source '%s' short response: %d regs (need 34)",
+          ESP_LOGW(TAG, "RTU RX: Source '%s' short response: %d regs (need 17)",
                    s.name, reg_count);
           s.poll_fail_count++;
         }
@@ -946,16 +981,43 @@ void SunSpecProxy::poll_rtu_sources_() {
 
     } else if (n == -1) {
       // CRC error (already logged in read_rtu_response_)
-      sources_[current_poll_source_].crc_error_count++;
-      sources_[current_poll_source_].poll_fail_count++;
+      if (current_poll_phase_ == -1) {
+        dtu_poll_fail_count_++;
+        current_poll_phase_ = 0;
+      } else {
+        sources_[current_poll_source_].crc_error_count++;
+        sources_[current_poll_source_].poll_fail_count++;
+      }
       rtu_busy_ = false;
 
     } else if (now - rtu_request_time_ > rtu_timeout_ms_) {
-      auto &s = sources_[current_poll_source_];
-      s.poll_timeout_count++;
-      ESP_LOGW(TAG, "RTU: Timeout for '%s' (DTU %d, port %d) — timeouts=%lu",
-               s.name, dtu_address_, s.port_number, s.poll_timeout_count);
+      if (current_poll_phase_ == -1) {
+        // DTU serial read timed out
+        dtu_poll_fail_count_++;
+        ESP_LOGW(TAG, "DTU: Timeout reading serial (DTU %d) — failures=%lu",
+                 dtu_address_, dtu_poll_fail_count_);
+        current_poll_phase_ = 0;  // Reset to inverter polling
+      } else {
+        auto &s = sources_[current_poll_source_];
+        s.poll_timeout_count++;
+        ESP_LOGW(TAG, "RTU: Timeout for '%s' (DTU %d, port %d) — timeouts=%lu",
+                 s.name, dtu_address_, s.port_number, s.poll_timeout_count);
+      }
       rtu_busy_ = false;
+    }
+    return;
+  }
+
+  // DTU serial read at startup or periodic DTU alive check (every 60 seconds)
+  bool time_for_dtu_poll = !dtu_serial_read_ || (now - last_dtu_poll_ok_ms_ > 60000);
+  
+  if (time_for_dtu_poll && current_poll_source_ == 0) {
+    ESP_LOGD(TAG, "DTU: Reading serial number from address 0x%04X", HM_DTU_SN_BASE);
+    if (send_rtu_request_(dtu_address_, 0x03, HM_DTU_SN_BASE, HM_DTU_SN_REGS)) {
+      rtu_busy_ = true;
+      rtu_request_time_ = now;
+      current_poll_phase_ = -1;  // Mark as DTU poll
+      last_poll_time_ = now;
     }
     return;
   }

@@ -17,30 +17,44 @@ namespace sunspec_proxy {
 static const uint16_t SUNSPEC_BASE = 40000;
 
 // Hoymiles Modbus RTU register map (for polling DTU-Pro)
-// Each inverter port has 40 registers (0x28) starting at 0x1000
-static const uint16_t HM_DATA_BASE = 0x1000;       // Port 0 data start
-static const uint16_t HM_PORT_STRIDE = 0x28;       // 40 registers per port
-static const uint16_t HM_STATUS_BASE = 0xC000;     // Status registers base
-static const uint16_t HM_DEVICE_SN_BASE = 0x2000;  // Device serial number base
+// IMPORTANT: Hoymiles spec uses BYTE addresses, but Modbus FC 0x03 uses REGISTER addresses
+// Conversion: Modbus_Register_Address = Byte_Address (since spec starts at 0x1000 bytes = 0x1000 registers)
+// Port stride: 0x28 bytes = 40 decimal = 20 Modbus registers
+static const uint16_t HM_DATA_BASE = 0x1000;       // Port 0 data start (Modbus register address)
+static const uint16_t HM_PORT_STRIDE = 0x28;       // 40 bytes = 20 registers per port
+static const uint16_t HM_STATUS_BASE = 0xC000;     // Status registers (use FC 0x01/0x02, not FC 0x03!)
+static const uint16_t HM_DEVICE_SN_BASE = 0x2000;  // Device serial number base (FC 0x03)
 
 // Hoymiles data register offsets (relative to port base)
-static const uint16_t HM_DATA_TYPE = 0x00;         // Data type
-static const uint16_t HM_SN_START = 0x01;          // Serial number (6 regs)
-static const uint16_t HM_PORT_NUM = 0x07;          // Port number
-static const uint16_t HM_PV_VOLTAGE = 0x08;        // PV voltage (V)
-static const uint16_t HM_PV_CURRENT = 0x09;        // PV current (A * 2)
-static const uint16_t HM_GRID_VOLTAGE = 0x0A;      // Grid voltage (V)
-static const uint16_t HM_GRID_FREQ = 0x0B;         // Grid frequency (Hz * 100)
-static const uint16_t HM_PV_POWER = 0x0C;          // PV power (W)
-static const uint16_t HM_TODAY_PROD_H = 0x0D;      // Today production high word (Wh)
-static const uint16_t HM_TODAY_PROD_L = 0x0E;      // Today production low word
-static const uint16_t HM_TOTAL_PROD_H = 0x0F;      // Total production high word (Wh)
-static const uint16_t HM_TOTAL_PROD_L = 0x10;      // Total production low word
-static const uint16_t HM_TEMPERATURE = 0x11;       // Temperature (°C)
-static const uint16_t HM_OPERATING_STATUS = 0x1E;  // Operating status
-static const uint16_t HM_ALARM_CODE = 0x1F;        // Alarm code
-static const uint16_t HM_LINK_STATUS = 0x20;       // Link status
-static const uint16_t HM_PORT_REGS = 0x28;         // Total registers per port (40)
+// These are REGISTER offsets, derived from byte addresses in spec:
+// Byte 0x1008 → Register (0x1008-0x1000)/2 = 4, etc.
+// 
+// Spec's "decimal" column: 1 = ×0.1 (divide by 10), 2 = ×0.01 (divide by 100)
+// Layout per port (20 registers):
+// Reg 0: [data_type(u8)][serial_byte_0(u8)]
+// Reg 1-2: serial bytes 1-4
+// Reg 3: [serial_byte_5(u8)][port_number(u8)]
+// Reg 4-16: live data (voltage, current, power, energy, temp, status, alarms)
+// Reg 17-19: reserved
+static const uint16_t HM_DATA_TYPE_SN = 0x00;      // Reg 0: [data_type(u8)][serial_byte_0]
+static const uint16_t HM_SN_REG1 = 0x01;           // Reg 1-2: serial bytes 1-4
+static const uint16_t HM_SN_PORT = 0x03;           // Reg 3: [serial_byte_5][port_number(u8)]
+static const uint16_t HM_PV_VOLTAGE = 0x04;        // PV voltage (×0.1 → V)
+static const uint16_t HM_PV_CURRENT = 0x05;        // PV current (×0.01 → A for HM/HMS)
+static const uint16_t HM_GRID_VOLTAGE = 0x06;      // Grid voltage (×0.1 → V)
+static const uint16_t HM_GRID_FREQ = 0x07;         // Grid frequency (×0.01 → Hz)
+static const uint16_t HM_PV_POWER = 0x08;          // PV power (×0.1 → W)
+static const uint16_t HM_TODAY_PROD = 0x09;        // Today production (raw Wh, uint16)
+static const uint16_t HM_TOTAL_PROD_H = 0x0A;      // Total production high word (uint32 Wh, no scaling)
+static const uint16_t HM_TOTAL_PROD_L = 0x0B;      // Total production low word
+static const uint16_t HM_TEMPERATURE = 0x0C;       // Temperature (×0.1 → °C, int16)
+static const uint16_t HM_OPERATING_STATUS = 0x0D;  // Operating status (uint16)
+static const uint16_t HM_ALARM_CODE = 0x0E;        // Alarm code (uint16)
+static const uint16_t HM_ALARM_COUNT = 0x0F;       // Alarm count (uint16)
+static const uint16_t HM_LINK_STATUS = 0x10;       // Link status in high byte (uint8)
+static const uint16_t HM_PORT_REGS = 20;           // Only 20 registers contain actual data
+static const uint16_t HM_DTU_SN_BASE = 0x2000;     // DTU serial number base address (3 regs = 6 bytes)
+static const uint16_t HM_DTU_SN_REGS = 3;          // Number of registers for DTU serial
 
 // Model sizes (register count)
 static const uint16_t MODEL_1_SIZE = 66;    // Common
@@ -214,6 +228,12 @@ class SunSpecProxy : public Component, public uart::UARTDevice {
   void set_victron_status_sensor(text_sensor::TextSensor *s) { victron_status_sensor_ = s; }
   void set_power_limit_sensor(sensor::Sensor *s) { power_limit_sensor_ = s; }
 
+  // --- DTU diagnostic sensors ---
+  void set_dtu_serial_sensor(text_sensor::TextSensor *s) { dtu_serial_sensor_ = s; }
+  void set_dtu_poll_ok_sensor(sensor::Sensor *s) { dtu_poll_ok_sensor_ = s; }
+  void set_dtu_poll_fail_sensor(sensor::Sensor *s) { dtu_poll_fail_sensor_ = s; }
+  void set_dtu_online_sensor(binary_sensor::BinarySensor *s) { dtu_online_sensor_ = s; }
+
  protected:
   // TCP server
   void setup_tcp_server_();
@@ -269,7 +289,7 @@ class SunSpecProxy : public Component, public uart::UARTDevice {
 
   // RTU polling state
   int current_poll_source_{0};
-  int current_poll_phase_{0}; // 0=model1 (once), 1=model101
+  int current_poll_phase_{0}; // -1=DTU serial read, 0=inverter data
   uint32_t last_poll_time_{0};
   bool rtu_busy_{false};
   uint32_t rtu_request_time_{0};
@@ -326,6 +346,17 @@ class SunSpecProxy : public Component, public uart::UARTDevice {
   binary_sensor::BinarySensor *victron_connected_sensor_{nullptr};
   text_sensor::TextSensor *victron_status_sensor_{nullptr};
   sensor::Sensor *power_limit_sensor_{nullptr};
+
+  // DTU diagnostics
+  char dtu_serial_[13]{};                // DTU serial number (hex string)
+  bool dtu_serial_read_{false};          // Have we read the DTU serial?
+  uint32_t dtu_poll_count_{0};           // Successful DTU polls
+  uint32_t dtu_poll_fail_count_{0};      // Failed DTU polls
+  uint32_t last_dtu_poll_ok_ms_{0};      // Timestamp of last successful DTU poll
+  text_sensor::TextSensor *dtu_serial_sensor_{nullptr};
+  sensor::Sensor *dtu_poll_ok_sensor_{nullptr};
+  sensor::Sensor *dtu_poll_fail_sensor_{nullptr};
+  binary_sensor::BinarySensor *dtu_online_sensor_{nullptr};
 };
 
 }  // namespace sunspec_proxy
