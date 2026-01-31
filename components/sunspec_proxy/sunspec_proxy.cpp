@@ -1,5 +1,6 @@
 #include "sunspec_proxy.h"
 #include "esphome/core/log.h"
+#include "esphome/core/hal.h"
 #include <cerrno>
 #include <fcntl.h>
 #include <cmath>
@@ -70,7 +71,10 @@ void SunSpecProxy::add_rtu_source(uint8_t port_number, uint8_t phases, uint16_t 
   strncpy(s.model, model.c_str(), 23); s.model[23] = 0;
   strncpy(s.serial_number, serial.c_str(), 32); s.serial_number[32] = 0;
   s.data_valid = false;
-  s.initial_model1_read = false;
+  s.mppt_count = 0;
+  for (int m = 0; m < MAX_MPPT_PER_INVERTER; m++) {
+    s.mppt[m].data_valid = false;
+  }
   num_sources_++;
   if (phases == 1) {
     ESP_LOGI(TAG, "Added RTU source #%d: '%s' (%s) port=%d, 1-phase on L%d, %dW, %d MPPT",
@@ -90,8 +94,8 @@ void SunSpecProxy::add_rtu_source(uint8_t port_number, uint8_t phases, uint16_t 
 
 void SunSpecProxy::setup() {
   ESP_LOGI(TAG, "============================================");
-  ESP_LOGI(TAG, "  SunSpec Proxy v1.2 — Hoymiles Modbus Mode");
-  ESP_LOGI(TAG, "  DTU address: %d, %d inverter ports", dtu_address_, num_sources_);
+  ESP_LOGI(TAG, "  SunSpec Proxy v2.0 — Hoymiles TCP Mode");
+  ESP_LOGI(TAG, "  DTU: %s:%d (unit_id=%d)", dtu_host_.c_str(), dtu_port_, dtu_address_);
   ESP_LOGI(TAG, "  Serving as unit_id %d on TCP :%d",
            agg_config_.unit_id, tcp_port_);
   ESP_LOGI(TAG, "  Manufacturer: %s", agg_config_.manufacturer);
@@ -121,7 +125,7 @@ void SunSpecProxy::setup() {
 
 void SunSpecProxy::loop() {
   handle_tcp_clients_();
-  poll_rtu_sources_();
+  poll_dtu_data_();
 
   // Periodic sensor publishing
   uint32_t now = millis();
@@ -129,6 +133,10 @@ void SunSpecProxy::loop() {
     last_sensor_publish_ms_ = now;
     for (int i = 0; i < num_sources_; i++) {
       publish_source_sensors_(i);
+      // Publish per-MPPT sensors if they exist
+      for (int m = 0; m < sources_[i].mppt_count; m++) {
+        publish_mppt_sensors_(i, m);
+      }
     }
     publish_aggregate_sensors_();
     publish_tcp_sensors_();
@@ -423,7 +431,7 @@ void SunSpecProxy::publish_source_sensors_(int idx) {
 
   // Statistics
   if (src_poll_ok_sensors_[idx]) src_poll_ok_sensors_[idx]->publish_state(s.poll_success_count);
-  if (src_poll_fail_sensors_[idx]) src_poll_fail_sensors_[idx]->publish_state(s.poll_fail_count + s.poll_timeout_count + s.crc_error_count);
+  if (src_poll_fail_sensors_[idx]) src_poll_fail_sensors_[idx]->publish_state(s.poll_fail_count);
   if (src_online_sensors_[idx]) src_online_sensors_[idx]->publish_state(online);
 
   update_source_status_(idx);
@@ -471,9 +479,6 @@ void SunSpecProxy::publish_tcp_sensors_() {
   }
 
   // DTU diagnostics
-  if (dtu_serial_sensor_ && dtu_serial_[0] != 0) {
-    dtu_serial_sensor_->publish_state(dtu_serial_);
-  }
   if (dtu_poll_ok_sensor_) {
     dtu_poll_ok_sensor_->publish_state(dtu_poll_count_);
   }
@@ -718,377 +723,493 @@ bool SunSpecProxy::write_sunspec_registers_(uint16_t start_reg, uint16_t count, 
 // ============================================================
 
 void SunSpecProxy::forward_power_limit_(uint16_t pct_raw, bool enabled) {
-  // Hoymiles status register layout per port:
-  // Port 0: 0xC006=ON/OFF, 0xC007=Limit%
-  // Port 1: 0xC00C=ON/OFF, 0xC00D=Limit%
-  // Port N: 0xC006 + N*6 = ON/OFF, 0xC007 + N*6 = Limit%
+  // TODO: Implement power limit forwarding via Modbus TCP
+  // DTU-Pro control register mapping for TCP mode needs to be tested
+  // For now, just log the command
   
-  for (int i = 0; i < num_sources_; i++) {
-    uint8_t port = sources_[i].port_number;
-    uint16_t onoff_reg = 0xC006 + (port * 6);
-    uint16_t limit_reg = 0xC007 + (port * 6);
-
-    if (enabled) {
-      // Convert SunSpec percentage (0-1000 = 0-100.0%) to Hoymiles percentage (2-100)
-      int hm_pct = pct_raw / 10;
-      if (hm_pct < 2) hm_pct = 2;
-      if (hm_pct > 100) hm_pct = 100;
-
-      ESP_LOGI(TAG, "RTU TX: Power limit %d%% to '%s' (DTU %d, port %d, reg 0x%04X)",
-               hm_pct, sources_[i].name, dtu_address_, port, limit_reg);
-
-      // Write power limit percentage
-      uint8_t f1[8];
-      f1[0] = dtu_address_; f1[1] = 0x06;
-      put_be16(&f1[2], limit_reg);
-      put_be16(&f1[4], hm_pct);
-      uint16_t crc = calc_crc16_(f1, 6);
-      f1[6] = crc & 0xFF; f1[7] = crc >> 8;
-      this->write_array(f1, 8);
-      this->flush();
-      delay(100);
-
-      // Ensure inverter is ON
-      uint8_t f2[8];
-      f2[0] = dtu_address_; f2[1] = 0x05;  // Function 0x05 for single coil write
-      put_be16(&f2[2], onoff_reg);
-      put_be16(&f2[4], 0xFF00);  // 0xFF00 = ON
-      uint16_t crc2 = calc_crc16_(f2, 6);
-      f2[6] = crc2 & 0xFF; f2[7] = crc2 >> 8;
-      this->write_array(f2, 8);
-      this->flush();
-      delay(100);
-    } else {
-      ESP_LOGI(TAG, "RTU TX: Removing power limit on '%s' (DTU %d, port %d)",
-               sources_[i].name, dtu_address_, port);
-
-      // Set limit to 100%
-      uint8_t f[8];
-      f[0] = dtu_address_; f[1] = 0x06;
-      put_be16(&f[2], limit_reg);
-      put_be16(&f[4], 100);
-      uint16_t crc = calc_crc16_(f, 6);
-      f[6] = crc & 0xFF; f[7] = crc >> 8;
-      this->write_array(f, 8);
-      this->flush();
-      delay(100);
-    }
+  float pct = pct_raw / 10.0f;
+  if (enabled) {
+    ESP_LOGI(TAG, "VICTRON: Power limit command received: %.1f%% (forwarding not yet implemented in TCP mode)", pct);
+  } else {
+    ESP_LOGI(TAG, "VICTRON: Power limit removed (forwarding not yet implemented in TCP mode)");
   }
+  
+  // Note: The DTU-Pro control registers (0xC000 series) may work differently over TCP
+  // than they did over RTU. This needs testing with the actual DTU before implementing.
 }
 
 // ============================================================
-// RTU Polling (Hoymiles Modbus RTU Protocol)
+// Modbus TCP Client (DTU-Pro Polling)
 // ============================================================
-// 
-// The DTU-Pro is polled at dtu_address_ using Hoymiles Modbus registers:
-// - Data registers: 0x1000 + (port * 20 regs) = FC 0x03 Read Holding Registers
-// - Status registers: 0xC000+ = FC 0x01/0x02 Read Coils/Discrete Inputs (NOT FC 0x03!)
-// - DTU serial: 0x2000 for 3 registers = FC 0x03
-// 
-// Per-port data layout (FC 0x03 from 0x1000 + port*20, read 20 registers):
-// NOTE: Hoymiles spec uses BYTE addresses; Modbus uses REGISTER addresses.
-// Register offsets below are derived from spec byte addresses / 2.
-// 
-// Offset | Field            | Spec Byte Addr | Scaling (decimal places)
-// -------|------------------|----------------|-------------------------
-//   0    | Data Type        | 0x1000-0x1001  | -
-//   0-3  | Serial (6 bytes) | 0x1001-0x1006  | -
-//   3    | Port Number      | 0x1007         | -
-//   4    | PV Voltage       | 0x1008-0x1009  | 1 (×0.1 → V)
-//   5    | PV Current       | 0x100A-0x100B  | 2 for HM (×0.01 → A)
-//   6    | Grid Voltage     | 0x100C-0x100D  | 1 (×0.1 → V)
-//   7    | Grid Frequency   | 0x100E-0x100F  | 2 (×0.01 → Hz)
-//   8    | PV Power         | 0x1010-0x1011  | 1 (×0.1 → W)
-//   9    | Today Prod       | 0x1012-0x1013  | none (raw Wh)
-//  10-11 | Total Prod       | 0x1014-0x1017  | none (uint32 Wh)
-//  12    | Temperature      | 0x1018-0x1019  | 1 (×0.1 → °C, signed)
-//  13    | Operating Status | 0x101A-0x101B  | -
-//  14    | Alarm Code       | 0x101C-0x101D  | -
-//  15    | Alarm Count      | 0x101E-0x101F  | -
-//  16    | Link Status      | 0x1020-0x1021  | high byte only
-// 17-19  | Reserved         | 0x1022-0x1027  | -
 
-void SunSpecProxy::poll_rtu_sources_() {
-  if (num_sources_ == 0) return;
+bool SunSpecProxy::connect_to_dtu_() {
+  if (dtu_fd_ >= 0) return true;  // Already connected
+  
   uint32_t now = millis();
-
-  // Handle pending RTU response
-  if (rtu_busy_) {
-    uint8_t resp[256];
-    int n = read_rtu_response_(resp, sizeof(resp));
-
-    if (n > 0) {
-      // Check if this is a DTU serial read response (phase -1)
-      if (current_poll_phase_ == -1) {
-        if (n >= 5 && resp[1] == 0x03) {
-          uint8_t byte_count = resp[2];
-          int reg_count = byte_count / 2;
-          
-          if (reg_count >= HM_DTU_SN_REGS) {
-            // Extract DTU serial number: 3 registers = 6 bytes
-            uint16_t reg_data[HM_DTU_SN_REGS];
-            for (int i = 0; i < HM_DTU_SN_REGS; i++) {
-              reg_data[i] = be16(&resp[3 + i * 2]);
-            }
-            
-            // Convert to hex string
-            uint8_t sn_bytes[6];
-            sn_bytes[0] = (reg_data[0] >> 8) & 0xFF;
-            sn_bytes[1] = reg_data[0] & 0xFF;
-            sn_bytes[2] = (reg_data[1] >> 8) & 0xFF;
-            sn_bytes[3] = reg_data[1] & 0xFF;
-            sn_bytes[4] = (reg_data[2] >> 8) & 0xFF;
-            sn_bytes[5] = reg_data[2] & 0xFF;
-            
-            for (int j = 0; j < 6; j++) {
-              snprintf(&dtu_serial_[j*2], 3, "%02x", sn_bytes[j]);
-            }
-            dtu_serial_[12] = 0;
-            
-            dtu_serial_read_ = true;
-            dtu_poll_count_++;
-            last_dtu_poll_ok_ms_ = now;
-            
-            ESP_LOGI(TAG, "DTU: Serial number: %s (poll OK count: %lu)", dtu_serial_, dtu_poll_count_);
-          } else {
-            ESP_LOGW(TAG, "DTU: Short serial response: %d regs (need %d)", reg_count, HM_DTU_SN_REGS);
-            dtu_poll_fail_count_++;
-          }
-        } else if (n >= 2 && (resp[1] & 0x80)) {
-          uint8_t exc = n >= 3 ? resp[2] : 0;
-          ESP_LOGW(TAG, "DTU: Exception response for serial read: func=0x%02X exc=%d", resp[1], exc);
-          dtu_poll_fail_count_++;
-        }
-        rtu_busy_ = false;
-        current_poll_phase_ = 0;  // Move to inverter polling
-        return;
-      }
-
-      // Otherwise, this is an inverter data response
-      auto &s = sources_[current_poll_source_];
-
-      if (n >= 5 && resp[1] == 0x03) {
-        uint8_t byte_count = resp[2];
-        int reg_count = byte_count / 2;
-        uint16_t reg_data[64];
-        for (int i = 0; i < reg_count && i < 64; i++) {
-          reg_data[i] = be16(&resp[3 + i * 2]);
-        }
-
-        // Parse Hoymiles data registers with CORRECTED offsets and scaling
-        if (reg_count >= 17) {  // Need at least up to HM_LINK_STATUS (0x10 = 17 regs minimum)
-          // Extract serial number: bytes 1-6 span regs 0-3
-          // Reg 0: [data_type(u8)][sn_byte_0]
-          // Reg 1: [sn_byte_1][sn_byte_2]
-          // Reg 2: [sn_byte_3][sn_byte_4]
-          // Reg 3: [sn_byte_5][port_number(u8)]
-          if (!s.initial_model1_read) {
-            uint8_t sn_bytes[6];
-            sn_bytes[0] = reg_data[HM_DATA_TYPE_SN] & 0xFF;           // low byte of reg 0
-            sn_bytes[1] = (reg_data[HM_SN_REG1] >> 8) & 0xFF;         // high byte of reg 1
-            sn_bytes[2] = reg_data[HM_SN_REG1] & 0xFF;                // low byte of reg 1
-            sn_bytes[3] = (reg_data[HM_SN_REG1 + 1] >> 8) & 0xFF;     // high byte of reg 2
-            sn_bytes[4] = reg_data[HM_SN_REG1 + 1] & 0xFF;            // low byte of reg 2
-            sn_bytes[5] = (reg_data[HM_SN_PORT] >> 8) & 0xFF;         // high byte of reg 3
-            
-            // Convert to hex string (like Python's hexlify)
-            char sn[13];
-            for (int j = 0; j < 6; j++) {
-              snprintf(&sn[j*2], 3, "%02x", sn_bytes[j]);
-            }
-            sn[12] = 0;
-            
-            if (sn[0] != 0) {
-              strncpy(s.serial_from_dtu, sn, 32);
-              if (s.serial_number[0] == 0) {
-                strncpy(s.serial_number, sn, 32);
-              }
-              ESP_LOGI(TAG, "RTU RX: Source '%s' (port %d) serial: %s", s.name, s.port_number, sn);
-            }
-            s.initial_model1_read = true;
-          }
-
-          // Parse live data with CORRECT Hoymiles scaling factors
-          // Spec's "decimal" column: 1 decimal place = ×0.1, 2 decimal places = ×0.01
-          s.pv_voltage_v = (float)reg_data[HM_PV_VOLTAGE] * 0.1f;         // decimal=1 → ×0.1 → V
-          // NOTE: PV Current scaling varies by model: HM/HMS = decimal 2 (×0.01), MI = decimal 1 (×0.1)
-          // TODO: Auto-detect model or make configurable if MI series support is needed
-          s.pv_current_a = (float)reg_data[HM_PV_CURRENT] * 0.01f;        // decimal=2 (HM/HMS) → ×0.01 → A
-          s.voltage_v = (float)reg_data[HM_GRID_VOLTAGE] * 0.1f;          // decimal=1 → ×0.1 → V
-          s.frequency_hz = (float)reg_data[HM_GRID_FREQ] * 0.01f;         // decimal=2 → ×0.01 → Hz
-          s.pv_power_w = (float)reg_data[HM_PV_POWER] * 0.1f;             // decimal=1 → ×0.1 → W
-          s.power_w = s.pv_power_w;  // Microinverter: AC output ≈ PV power
-          
-          // Today production: single uint16, raw Wh (NO scaling)
-          s.today_energy_wh = (float)reg_data[HM_TODAY_PROD];
-          
-          // Total production: uint32, raw Wh (NO scaling, high word first)
-          uint32_t total_wh = ((uint32_t)reg_data[HM_TOTAL_PROD_H] << 16) | reg_data[HM_TOTAL_PROD_L];
-          s.energy_kwh = (float)total_wh / 1000.0f;
-          
-          // Temperature: int16, ×0.1 → °C
-          s.temperature_c = (float)(int16_t)reg_data[HM_TEMPERATURE] * 0.1f;
-          
-          s.operating_status = reg_data[HM_OPERATING_STATUS];
-          s.alarm_code = reg_data[HM_ALARM_CODE];
-          s.alarm_count = reg_data[HM_ALARM_COUNT];
-          s.link_status = (reg_data[HM_LINK_STATUS] >> 8) & 0xFF;  // High byte only
-          s.producing = (s.power_w > 0);
-
-          // Estimate AC current from power/voltage
-          if (s.voltage_v > 0) {
-            s.current_a = s.power_w / s.voltage_v;
-          }
-
-          s.data_valid = true;
-          s.last_poll_ms = now;
-          s.poll_success_count++;
-
-          // DEBUG logging with hex dump of first few regs
-          ESP_LOGD(TAG, "RTU RX: '%s' (port %d) — P=%.0fW (PV: %.1fV/%.2fA=%.0fW), Grid: %.0fV/%.2fHz, T=%.1f°C, Today=%.0fWh, Total=%.1fkWh, Status=0x%04X, Alarm=%d/%d, Link=0x%02X",
-                   s.name, s.port_number, s.power_w, 
-                   s.pv_voltage_v, s.pv_current_a, s.pv_power_w,
-                   s.voltage_v, s.frequency_hz, s.temperature_c,
-                   s.today_energy_wh, s.energy_kwh,
-                   s.operating_status, s.alarm_code, s.alarm_count, s.link_status);
-          
-          // Extra verbose hex dump for first 10 regs for debugging
-          if (reg_count >= 10) {
-            ESP_LOGV(TAG, "  RAW regs 0-9: %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X",
-                     reg_data[0], reg_data[1], reg_data[2], reg_data[3], reg_data[4],
-                     reg_data[5], reg_data[6], reg_data[7], reg_data[8], reg_data[9]);
-          }
-
-          aggregate_and_update_registers_();
-        } else {
-          ESP_LOGW(TAG, "RTU RX: Source '%s' short response: %d regs (need 17)",
-                   s.name, reg_count);
-          s.poll_fail_count++;
-        }
-      } else if (n >= 2 && (resp[1] & 0x80)) {
-        // Exception response
-        uint8_t exc = n >= 3 ? resp[2] : 0;
-        ESP_LOGW(TAG, "RTU RX: DTU exception for port %d: func=0x%02X exc=%d",
-                 sources_[current_poll_source_].port_number, resp[1], exc);
-        sources_[current_poll_source_].poll_fail_count++;
-      } else {
-        ESP_LOGW(TAG, "RTU RX: Unexpected response (%d bytes, func=0x%02X)",
-                 n, resp[1]);
-        sources_[current_poll_source_].poll_fail_count++;
-      }
-
-      rtu_busy_ = false;
-
-    } else if (n == -1) {
-      // CRC error (already logged in read_rtu_response_)
-      if (current_poll_phase_ == -1) {
-        dtu_poll_fail_count_++;
-        current_poll_phase_ = 0;
-      } else {
-        sources_[current_poll_source_].crc_error_count++;
-        sources_[current_poll_source_].poll_fail_count++;
-      }
-      rtu_busy_ = false;
-
-    } else if (now - rtu_request_time_ > rtu_timeout_ms_) {
-      if (current_poll_phase_ == -1) {
-        // DTU serial read timed out
-        dtu_poll_fail_count_++;
-        ESP_LOGW(TAG, "DTU: Timeout reading serial (DTU %d) — failures=%lu",
-                 dtu_address_, dtu_poll_fail_count_);
-        current_poll_phase_ = 0;  // Reset to inverter polling
-      } else {
-        auto &s = sources_[current_poll_source_];
-        s.poll_timeout_count++;
-        ESP_LOGW(TAG, "RTU: Timeout for '%s' (DTU %d, port %d) — timeouts=%lu",
-                 s.name, dtu_address_, s.port_number, s.poll_timeout_count);
-      }
-      rtu_busy_ = false;
-    }
-    return;
-  }
-
-  // DTU serial read at startup or periodic DTU alive check (every 60 seconds)
-  bool time_for_dtu_poll = !dtu_serial_read_ || (now - last_dtu_poll_ok_ms_ > 60000);
+  if (now - last_dtu_connect_attempt_ < 5000) return false;  // Throttle reconnects
+  last_dtu_connect_attempt_ = now;
   
-  if (time_for_dtu_poll && current_poll_source_ == 0) {
-    ESP_LOGD(TAG, "DTU: Reading serial number from address 0x%04X", HM_DTU_SN_BASE);
-    if (send_rtu_request_(dtu_address_, 0x03, HM_DTU_SN_BASE, HM_DTU_SN_REGS)) {
-      rtu_busy_ = true;
-      rtu_request_time_ = now;
-      current_poll_phase_ = -1;  // Mark as DTU poll
-      last_poll_time_ = now;
-    }
-    return;
-  }
-
-  // Time for next poll?
-  uint32_t interval_per_source = poll_interval_ms_ / num_sources_;
-  if (now - last_poll_time_ < interval_per_source) return;
-
-  auto &s = sources_[current_poll_source_];
-
-  // Calculate register address for this port: 0x1000 + (port * 0x28)
-  uint16_t port_base = HM_DATA_BASE + (s.port_number * HM_PORT_STRIDE);
+  ESP_LOGI(TAG, "DTU: Connecting to %s:%d...", dtu_host_.c_str(), dtu_port_);
   
-  ESP_LOGV(TAG, "RTU TX: Reading port %d from DTU %d (regs 0x%04X-0x%04X)",
-           s.port_number, dtu_address_, port_base, port_base + HM_PORT_REGS - 1);
-  
-  // Read all 40 registers for this port from the DTU
-  if (send_rtu_request_(dtu_address_, 0x03, port_base, HM_PORT_REGS)) {
-    rtu_busy_ = true;
-    rtu_request_time_ = now;
+  // Resolve hostname
+  struct hostent *host = gethostbyname(dtu_host_.c_str());
+  if (!host) {
+    ESP_LOGW(TAG, "DTU: DNS lookup failed for %s", dtu_host_.c_str());
+    dtu_poll_fail_count_++;
+    return false;
   }
-
-  // Move to next source
-  current_poll_source_ = (current_poll_source_ + 1) % num_sources_;
-  last_poll_time_ = now;
-}
-
-bool SunSpecProxy::send_rtu_request_(uint8_t address, uint8_t function, uint16_t reg_start, uint16_t reg_count) {
-  while (this->available()) this->read();
-
-  uint8_t frame[8];
-  frame[0] = address;
-  frame[1] = function;
-  put_be16(&frame[2], reg_start);
-  put_be16(&frame[4], reg_count);
-  uint16_t crc = calc_crc16_(frame, 6);
-  frame[6] = crc & 0xFF;
-  frame[7] = (crc >> 8) & 0xFF;
-
-  this->write_array(frame, 8);
-  this->flush();
+  
+  // Create socket
+  dtu_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+  if (dtu_fd_ < 0) {
+    ESP_LOGE(TAG, "DTU: Socket create failed: errno=%d", errno);
+    dtu_poll_fail_count_++;
+    return false;
+  }
+  
+  // Set non-blocking
+  fcntl(dtu_fd_, F_SETFL, fcntl(dtu_fd_, F_GETFL, 0) | O_NONBLOCK);
+  
+  // Connect
+  struct sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(dtu_port_);
+  memcpy(&addr.sin_addr, host->h_addr, host->h_length);
+  
+  int res = connect(dtu_fd_, (struct sockaddr *)&addr, sizeof(addr));
+  if (res < 0 && errno != EINPROGRESS) {
+    ESP_LOGW(TAG, "DTU: Connect failed: errno=%d", errno);
+    close(dtu_fd_);
+    dtu_fd_ = -1;
+    dtu_poll_fail_count_++;
+    return false;
+  }
+  
+  // Wait for connection (with timeout)
+  fd_set wfds;
+  struct timeval tv;
+  FD_ZERO(&wfds);
+  FD_SET(dtu_fd_, &wfds);
+  tv.tv_sec = 2;
+  tv.tv_usec = 0;
+  
+  res = select(dtu_fd_ + 1, nullptr, &wfds, nullptr, &tv);
+  if (res <= 0) {
+    ESP_LOGW(TAG, "DTU: Connect timeout");
+    close(dtu_fd_);
+    dtu_fd_ = -1;
+    dtu_poll_fail_count_++;
+    return false;
+  }
+  
+  // Check socket error
+  int err = 0;
+  socklen_t len = sizeof(err);
+  getsockopt(dtu_fd_, SOL_SOCKET, SO_ERROR, &err, &len);
+  if (err) {
+    ESP_LOGW(TAG, "DTU: Connect failed: err=%d", err);
+    close(dtu_fd_);
+    dtu_fd_ = -1;
+    dtu_poll_fail_count_++;
+    return false;
+  }
+  
+  dtu_connected_ = true;
+  ESP_LOGI(TAG, "DTU: Connected successfully");
   return true;
 }
 
-int SunSpecProxy::read_rtu_response_(uint8_t *buf, int max_len) {
-  int n = 0;
-  while (this->available() && n < max_len) {
-    buf[n++] = this->read();
+void SunSpecProxy::close_dtu_connection_() {
+  if (dtu_fd_ >= 0) {
+    close(dtu_fd_);
+    dtu_fd_ = -1;
+    dtu_connected_ = false;
   }
-  if (n < 5) return 0;
+}
 
-  uint16_t expected = calc_crc16_(buf, n - 2);
-  uint16_t received = buf[n - 2] | ((uint16_t)buf[n - 1] << 8);
-  if (expected != received) {
-    ESP_LOGW(TAG, "RTU: CRC error — expected 0x%04X, got 0x%04X (%d bytes from addr %d)",
-             expected, received, n, buf[0]);
+bool SunSpecProxy::send_modbus_tcp_request_(uint8_t function, uint16_t reg_start, uint16_t reg_count) {
+  if (!dtu_connected_) return false;
+  
+  uint8_t frame[12];
+  put_be16(&frame[0], modbus_transaction_id_);
+  put_be16(&frame[2], 0);  // Protocol ID = 0
+  put_be16(&frame[4], 6);  // Length = 6 (unit_id + function + data)
+  frame[6] = dtu_address_;
+  frame[7] = function;
+  put_be16(&frame[8], reg_start);
+  put_be16(&frame[10], reg_count);
+  
+  int sent = send(dtu_fd_, frame, 12, 0);
+  if (sent != 12) {
+    ESP_LOGW(TAG, "DTU: Send failed (%d bytes, errno=%d)", sent, errno);
+    close_dtu_connection_();
+    return false;
+  }
+  
+  modbus_transaction_id_++;
+  return true;
+}
+
+int SunSpecProxy::read_modbus_tcp_response_(uint8_t *buf, int max_len) {
+  if (!dtu_connected_) return 0;
+  
+  // Read with timeout
+  fd_set rfds;
+  struct timeval tv;
+  FD_ZERO(&rfds);
+  FD_SET(dtu_fd_, &rfds);
+  tv.tv_sec = tcp_timeout_ms_ / 1000;
+  tv.tv_usec = (tcp_timeout_ms_ % 1000) * 1000;
+  
+  int res = select(dtu_fd_ + 1, &rfds, nullptr, nullptr, &tv);
+  if (res <= 0) {
+    if (res == 0) ESP_LOGW(TAG, "DTU: Read timeout");
+    else ESP_LOGW(TAG, "DTU: Select error: errno=%d", errno);
+    close_dtu_connection_();
     return -1;
   }
+  
+  int n = recv(dtu_fd_, buf, max_len, 0);
+  if (n <= 0) {
+    ESP_LOGW(TAG, "DTU: Connection closed (recv=%d, errno=%d)", n, errno);
+    close_dtu_connection_();
+    return -1;
+  }
+  
+  // Validate MBAP header
+  if (n < 8) {
+    ESP_LOGW(TAG, "DTU: Short response (%d bytes)", n);
+    return -1;
+  }
+  
+  uint16_t trans_id = be16(&buf[0]);
+  uint16_t proto_id = be16(&buf[2]);
+  uint16_t length = be16(&buf[4]);
+  
+  if (proto_id != 0) {
+    ESP_LOGW(TAG, "DTU: Invalid protocol ID: %d", proto_id);
+    return -1;
+  }
+  
+  // Check for exception
+  if (buf[7] & 0x80) {
+    uint8_t exc = n >= 9 ? buf[8] : 0;
+    ESP_LOGW(TAG, "DTU: Modbus exception: func=0x%02X, exc=%d", buf[7], exc);
+    return -1;
+  }
+  
   return n;
 }
 
-uint16_t SunSpecProxy::calc_crc16_(const uint8_t *data, uint16_t len) {
-  uint16_t crc = 0xFFFF;
-  for (uint16_t i = 0; i < len; i++) {
-    crc ^= data[i];
-    for (int j = 0; j < 8; j++) {
-      if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
-      else crc >>= 1;
+// NEW poll_dtu_data_ implementation
+void SunSpecProxy::poll_dtu_data_() {
+  uint32_t now = millis();
+  
+  // Time for next poll?
+  if (now - last_poll_time_ < poll_interval_ms_) return;
+  last_poll_time_ = now;
+  
+  // Ensure connection
+  if (!connect_to_dtu_()) {
+    ESP_LOGW(TAG, "DTU: Not connected, skipping poll");
+    return;
+  }
+  
+  // Read all 200 registers from 0x4000 (8 MPPT channels × 25 regs)
+  // Split into two reads if needed (max 125 regs per Modbus read)
+  ESP_LOGD(TAG, "DTU: Reading %d registers from 0x%04X", HM_TOTAL_REGS, HM_DATA_BASE);
+  
+  // Read first 125 registers
+  if (!send_modbus_tcp_request_(0x03, HM_DATA_BASE, 125)) {
+    ESP_LOGW(TAG, "DTU: Failed to send request (chunk 1)");
+    dtu_poll_fail_count_++;
+    return;
+  }
+  
+  uint8_t resp[512];
+  int n = read_modbus_tcp_response_(resp, sizeof(resp));
+  if (n < 0) {
+    ESP_LOGW(TAG, "DTU: Failed to read response (chunk 1)");
+    dtu_poll_fail_count_++;
+    return;
+  }
+  
+  // Parse first chunk
+  if (n >= 9 && resp[7] == 0x03) {
+    uint8_t byte_count = resp[8];
+    int reg_count = byte_count / 2;
+    if (reg_count >= 125) {
+      for (int i = 0; i < 125; i++) {
+        dtu_regs_[i] = be16(&resp[9 + i * 2]);
+      }
+    } else {
+      ESP_LOGW(TAG, "DTU: Short response chunk 1: %d regs", reg_count);
+      dtu_poll_fail_count_++;
+      return;
+    }
+  } else {
+    ESP_LOGW(TAG, "DTU: Invalid response chunk 1");
+    dtu_poll_fail_count_++;
+    return;
+  }
+  
+  // Read remaining 75 registers
+  if (!send_modbus_tcp_request_(0x03, HM_DATA_BASE + 125, 75)) {
+    ESP_LOGW(TAG, "DTU: Failed to send request (chunk 2)");
+    dtu_poll_fail_count_++;
+    return;
+  }
+  
+  n = read_modbus_tcp_response_(resp, sizeof(resp));
+  if (n < 0) {
+    ESP_LOGW(TAG, "DTU: Failed to read response (chunk 2)");
+    dtu_poll_fail_count_++;
+    return;
+  }
+  
+  // Parse second chunk
+  if (n >= 9 && resp[7] == 0x03) {
+    uint8_t byte_count = resp[8];
+    int reg_count = byte_count / 2;
+    if (reg_count >= 75) {
+      for (int i = 0; i < 75; i++) {
+        dtu_regs_[125 + i] = be16(&resp[9 + i * 2]);
+      }
+      dtu_data_valid_ = true;
+      dtu_poll_count_++;
+      last_dtu_poll_ok_ms_ = now;
+    } else {
+      ESP_LOGW(TAG, "DTU: Short response chunk 2: %d regs", reg_count);
+      dtu_poll_fail_count_++;
+      return;
+    }
+  } else {
+    ESP_LOGW(TAG, "DTU: Invalid response chunk 2");
+    dtu_poll_fail_count_++;
+    return;
+  }
+  
+  ESP_LOGI(TAG, "DTU: Successfully read 200 registers (poll count: %lu)", dtu_poll_count_);
+  
+  // Parse register data
+  parse_dtu_registers_(dtu_regs_, HM_TOTAL_REGS);
+  
+  // Map MPPT channels to inverters
+  map_mppt_to_inverters_();
+  
+  // Aggregate per-inverter data
+  for (int i = 0; i < num_sources_; i++) {
+    aggregate_inverter_data_(i);
+  }
+  
+  // Update SunSpec registers
+  aggregate_and_update_registers_();
+}
+
+void SunSpecProxy::parse_dtu_registers_(const uint16_t *regs, int reg_count) {
+  ESP_LOGD(TAG, "DTU: Parsing %d registers into MPPT channel data", reg_count);
+  
+  // Clear all inverter MPPT data first
+  for (int i = 0; i < num_sources_; i++) {
+    sources_[i].mppt_count = 0;
+    for (int m = 0; m < MAX_MPPT_PER_INVERTER; m++) {
+      sources_[i].mppt[m].data_valid = false;
     }
   }
-  return crc;
+  
+  // Parse each 25-register block
+  int channels_found = 0;
+  for (int ch = 0; ch < HM_MAX_CHANNELS && ch * HM_MPPT_STRIDE < reg_count; ch++) {
+    const uint16_t *ch_regs = &regs[ch * HM_MPPT_STRIDE];
+    
+    // Check marker
+    uint16_t marker = ch_regs[HM_MARKER];
+    if (marker != 12) {
+      ESP_LOGV(TAG, "DTU: Channel %d marker invalid (%d), skipping", ch, marker);
+      continue;
+    }
+    
+    // Extract inverter serial number (3 regs = 6 bytes)
+    char inv_sn[13];
+    uint8_t sn_bytes[6];
+    sn_bytes[0] = (ch_regs[HM_INV_SN_1] >> 8) & 0xFF;
+    sn_bytes[1] = ch_regs[HM_INV_SN_1] & 0xFF;
+    sn_bytes[2] = (ch_regs[HM_INV_SN_2] >> 8) & 0xFF;
+    sn_bytes[3] = ch_regs[HM_INV_SN_2] & 0xFF;
+    sn_bytes[4] = (ch_regs[HM_INV_SN_3] >> 8) & 0xFF;
+    sn_bytes[5] = ch_regs[HM_INV_SN_3] & 0xFF;
+    
+    for (int j = 0; j < 6; j++) {
+      snprintf(&inv_sn[j*2], 3, "%02x", sn_bytes[j]);
+    }
+    inv_sn[12] = 0;
+    
+    // Extract MPPT number
+    uint16_t mppt_num = ch_regs[HM_MPPT_NUM];
+    
+    // Find matching inverter by serial number
+    int inv_idx = -1;
+    for (int i = 0; i < num_sources_; i++) {
+      if (strlen(sources_[i].serial_number) > 0 && strcmp(sources_[i].serial_number, inv_sn) == 0) {
+        inv_idx = i;
+        break;
+      }
+    }
+    
+    if (inv_idx < 0) {
+      ESP_LOGD(TAG, "DTU: Channel %d: SN=%s MPPT=%d (no matching inverter config)", ch, inv_sn, mppt_num);
+      continue;
+    }
+    
+    auto &inv = sources_[inv_idx];
+    
+    // Find or create MPPT slot
+    int mppt_idx = -1;
+    for (int m = 0; m < inv.mppt_count; m++) {
+      if (inv.mppt[m].mppt_num == mppt_num) {
+        mppt_idx = m;
+        break;
+      }
+    }
+    if (mppt_idx < 0 && inv.mppt_count < MAX_MPPT_PER_INVERTER) {
+      mppt_idx = inv.mppt_count++;
+    }
+    if (mppt_idx < 0) {
+      ESP_LOGW(TAG, "DTU: No MPPT slot available for %s MPPT%d", inv.name, mppt_num);
+      continue;
+    }
+    
+    auto &mppt = inv.mppt[mppt_idx];
+    mppt.mppt_num = mppt_num;
+    mppt.data_valid = true;
+    
+    // Decode values with correct scaling
+    mppt.dc_voltage_v = (float)ch_regs[HM_DC_VOLTAGE] / 10.0f;
+    mppt.dc_current_a = (float)ch_regs[HM_DC_CURRENT] / 100.0f;  // ÷100, not ÷10!
+    mppt.ac_voltage_v = (float)ch_regs[HM_AC_VOLTAGE] / 10.0f;
+    mppt.frequency_hz = (float)ch_regs[HM_FREQUENCY] / 100.0f;
+    mppt.power_w = (float)ch_regs[HM_POWER] / 10.0f;
+    mppt.today_energy_wh = (float)ch_regs[HM_TODAY_ENERGY];
+    
+    uint32_t total_wh = ((uint32_t)ch_regs[HM_TOTAL_ENERGY_H] << 16) | ch_regs[HM_TOTAL_ENERGY_L];
+    mppt.total_energy_kwh = (float)total_wh / 1000.0f;
+    
+    mppt.temperature_c = (float)(int16_t)ch_regs[HM_TEMPERATURE] / 10.0f;
+    mppt.status = ch_regs[HM_STATUS];
+    
+    channels_found++;
+    
+    ESP_LOGD(TAG, "DTU: Ch%d → %s MPPT%d: %.0fW (DC: %.1fV/%.2fA), AC: %.0fV/%.2fHz, Today: %.0fWh, Total: %.1fkWh, T: %.1f°C, Status: %d",
+             ch, inv.name, mppt_num, mppt.power_w, 
+             mppt.dc_voltage_v, mppt.dc_current_a,
+             mppt.ac_voltage_v, mppt.frequency_hz,
+             mppt.today_energy_wh, mppt.total_energy_kwh,
+             mppt.temperature_c, mppt.status);
+  }
+  
+  ESP_LOGI(TAG, "DTU: Parsed %d MPPT channels from register data", channels_found);
+}
+
+void SunSpecProxy::map_mppt_to_inverters_() {
+  // Already done in parse_dtu_registers_ via serial number matching
+}
+
+void SunSpecProxy::aggregate_inverter_data_(int inv_idx) {
+  auto &inv = sources_[inv_idx];
+  
+  // Reset aggregates
+  inv.power_w = 0;
+  inv.voltage_v = 0;
+  inv.current_a = 0;
+  inv.frequency_hz = 0;
+  inv.energy_kwh = 0;
+  inv.today_energy_wh = 0;
+  inv.temperature_c = NAN;
+  inv.pv_voltage_v = 0;
+  inv.pv_current_a = 0;
+  inv.pv_power_w = 0;
+  inv.producing = false;
+  inv.data_valid = false;
+  
+  if (inv.mppt_count == 0) return;
+  
+  int valid_count = 0;
+  float max_temp = NAN;
+  
+  for (int m = 0; m < inv.mppt_count; m++) {
+    auto &mppt = inv.mppt[m];
+    if (!mppt.data_valid) continue;
+    
+    valid_count++;
+    inv.power_w += mppt.power_w;
+    inv.pv_power_w += mppt.power_w;  // For microinverters, AC ≈ DC
+    inv.voltage_v += mppt.ac_voltage_v;
+    inv.frequency_hz += mppt.frequency_hz;
+    inv.today_energy_wh += mppt.today_energy_wh;
+    inv.energy_kwh += mppt.total_energy_kwh;
+    
+    // DC side
+    inv.pv_voltage_v += mppt.dc_voltage_v;
+    inv.pv_current_a += mppt.dc_current_a;
+    
+    // Max temperature
+    if (std::isnan(max_temp) || mppt.temperature_c > max_temp) {
+      max_temp = mppt.temperature_c;
+    }
+    
+    if (mppt.power_w > 0) inv.producing = true;
+  }
+  
+  if (valid_count > 0) {
+    inv.voltage_v /= valid_count;
+    inv.frequency_hz /= valid_count;
+    inv.pv_voltage_v /= valid_count;
+    inv.temperature_c = max_temp;
+    inv.data_valid = true;
+    inv.last_poll_ms = millis();
+    
+    // Estimate current from power/voltage
+    if (inv.voltage_v > 0) {
+      inv.current_a = inv.power_w / inv.voltage_v;
+    }
+    
+    inv.poll_success_count++;
+    
+    ESP_LOGI(TAG, "INV: %s — P=%.0fW (DC: %.1fV/%.2fA=%.0fW), AC: %.1fV/%.2fHz, Today=%.0fWh, Total=%.1fkWh, T=%.1f°C (%d MPPTs)",
+             inv.name, inv.power_w,
+             inv.pv_voltage_v, inv.pv_current_a, inv.pv_power_w,
+             inv.voltage_v, inv.frequency_hz,
+             inv.today_energy_wh, inv.energy_kwh,
+             inv.temperature_c, valid_count);
+  }
+}
+
+void SunSpecProxy::publish_mppt_sensors_(int inv_idx, int mppt_idx) {
+  auto &inv = sources_[inv_idx];
+  if (mppt_idx >= inv.mppt_count) return;
+  
+  auto &mppt = inv.mppt[mppt_idx];
+  if (!mppt.data_valid) return;
+  
+  // Publish per-MPPT sensors if configured
+  if (mppt_dc_voltage_sensors_[inv_idx][mppt_idx]) 
+    mppt_dc_voltage_sensors_[inv_idx][mppt_idx]->publish_state(mppt.dc_voltage_v);
+  if (mppt_dc_current_sensors_[inv_idx][mppt_idx]) 
+    mppt_dc_current_sensors_[inv_idx][mppt_idx]->publish_state(mppt.dc_current_a);
+  if (mppt_dc_power_sensors_[inv_idx][mppt_idx]) 
+    mppt_dc_power_sensors_[inv_idx][mppt_idx]->publish_state(mppt.dc_voltage_v * mppt.dc_current_a);
+  if (mppt_ac_voltage_sensors_[inv_idx][mppt_idx]) 
+    mppt_ac_voltage_sensors_[inv_idx][mppt_idx]->publish_state(mppt.ac_voltage_v);
+  if (mppt_frequency_sensors_[inv_idx][mppt_idx]) 
+    mppt_frequency_sensors_[inv_idx][mppt_idx]->publish_state(mppt.frequency_hz);
+  if (mppt_power_sensors_[inv_idx][mppt_idx]) 
+    mppt_power_sensors_[inv_idx][mppt_idx]->publish_state(mppt.power_w);
+  if (mppt_today_energy_sensors_[inv_idx][mppt_idx]) 
+    mppt_today_energy_sensors_[inv_idx][mppt_idx]->publish_state(mppt.today_energy_wh);
+  if (mppt_total_energy_sensors_[inv_idx][mppt_idx]) 
+    mppt_total_energy_sensors_[inv_idx][mppt_idx]->publish_state(mppt.total_energy_kwh);
+  if (mppt_temperature_sensors_[inv_idx][mppt_idx]) 
+    mppt_temperature_sensors_[inv_idx][mppt_idx]->publish_state(mppt.temperature_c);
 }
 
 }  // namespace sunspec_proxy

@@ -1,6 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import uart, sensor, text_sensor, binary_sensor
+from esphome.components import sensor, text_sensor, binary_sensor
 from esphome.const import (
     CONF_ID,
     CONF_NAME,
@@ -23,21 +23,23 @@ from esphome.const import (
     ENTITY_CATEGORY_DIAGNOSTIC,
 )
 
-DEPENDENCIES = ["uart"]
+DEPENDENCIES = []
 AUTO_LOAD = ["sensor", "text_sensor", "binary_sensor"]
 
 # Component configuration keys
 CONF_TCP_PORT = "tcp_port"
 CONF_UNIT_ID = "unit_id"
-CONF_DTU_ADDRESS = "dtu_address"  # Modbus address of DTU-Pro (101-254, usually 126)
+CONF_DTU_HOST = "dtu_host"         # DTU-Pro IP address or hostname
+CONF_DTU_PORT = "dtu_port"         # DTU-Pro Modbus TCP port (default 502)
+CONF_DTU_ADDRESS = "dtu_address"   # DTU Modbus unit ID (default 101)
 CONF_PHASES = "phases"
 CONF_RATED_VOLTAGE_V = "rated_voltage_v"
 CONF_MANUFACTURER = "manufacturer"
 CONF_MODEL_NAME = "model_name"
 CONF_SERIAL_NUMBER = "serial_number"
 CONF_POLL_INTERVAL_MS = "poll_interval_ms"
-CONF_RTU_TIMEOUT_MS = "rtu_timeout_ms"
-CONF_RTU_SOURCES = "rtu_sources"
+CONF_TCP_TIMEOUT_MS = "tcp_timeout_ms"
+CONF_RTU_SOURCES = "rtu_sources"  # Keep name for backward compat, but now represents inverters
 
 # Per-source configuration keys
 CONF_RTU_ADDRESS = "rtu_address"  # Legacy: treat as port number if < 100
@@ -50,15 +52,16 @@ CONF_MPPT_INPUTS = "mppt_inputs"
 
 # Sensor enable flags
 CONF_SENSORS = "sensors"
+CONF_MPPT_SENSORS = "mppt_sensors"  # Enable per-MPPT sensors
 CONF_SENSOR_POWER = "power"
 CONF_SENSOR_VOLTAGE = "voltage"
 CONF_SENSOR_CURRENT = "current"
 CONF_SENSOR_FREQUENCY = "frequency"
 CONF_SENSOR_ENERGY = "energy"
 CONF_SENSOR_TEMPERATURE = "temperature"
-CONF_SENSOR_PV_VOLTAGE = "pv_voltage"
-CONF_SENSOR_PV_CURRENT = "pv_current"
-CONF_SENSOR_PV_POWER = "pv_power"
+CONF_SENSOR_PV_VOLTAGE = "pv_voltage"  # DC voltage (per MPPT when enabled)
+CONF_SENSOR_PV_CURRENT = "pv_current"  # DC current (per MPPT when enabled)
+CONF_SENSOR_PV_POWER = "pv_power"      # DC power (per MPPT when enabled)
 CONF_SENSOR_ALARM_CODE = "alarm_code"
 CONF_SENSOR_ALARM_COUNT = "alarm_count"
 CONF_SENSOR_LINK_STATUS = "link_status"
@@ -81,7 +84,7 @@ CONF_SENSOR_DTU_POLL_SUCCESS = "dtu_poll_success"
 CONF_SENSOR_DTU_POLL_FAIL = "dtu_poll_fail"
 
 sunspec_proxy_ns = cg.esphome_ns.namespace("sunspec_proxy")
-SunSpecProxy = sunspec_proxy_ns.class_("SunSpecProxy", cg.Component, uart.UARTDevice)
+SunSpecProxy = sunspec_proxy_ns.class_("SunSpecProxy", cg.Component)
 
 # Known Hoymiles inverter models with their characteristics
 HOYMILES_MODELS = {
@@ -140,6 +143,7 @@ SOURCE_SENSORS_SCHEMA = cv.Schema(
         cv.Optional(CONF_SENSOR_LINK_STATUS, default=True): cv.boolean,
         cv.Optional(CONF_SENSOR_OPERATING_STATUS, default=True): cv.boolean,
         cv.Optional(CONF_SENSOR_TODAY_ENERGY, default=True): cv.boolean,
+        cv.Optional(CONF_MPPT_SENSORS, default=False): cv.boolean,  # Enable per-MPPT sensors
     }
 )
 
@@ -186,30 +190,28 @@ RTU_SOURCE_SCHEMA = cv.Schema(
 )
 
 # Main component configuration schema
-CONFIG_SCHEMA = (
-    cv.Schema(
-        {
-            cv.GenerateID(): cv.declare_id(SunSpecProxy),
-            cv.Optional(CONF_TCP_PORT, default=502): cv.port,
-            cv.Optional(CONF_UNIT_ID, default=126): cv.int_range(min=1, max=247),
-            cv.Optional(CONF_PHASES, default=3): cv.int_range(min=1, max=3),
-            cv.Optional(CONF_RATED_VOLTAGE_V, default=230): cv.int_range(min=1),
-            cv.Optional(CONF_MANUFACTURER, default="Fronius"): cv.string,
-            cv.Optional(CONF_MODEL_NAME, default="Hoymiles Bridge"): cv.string,
-            cv.Optional(CONF_SERIAL_NUMBER, default="HM-BRIDGE-001"): cv.string,
-            cv.Required(CONF_RTU_SOURCES): cv.All(
-                cv.ensure_list(RTU_SOURCE_SCHEMA), cv.Length(min=1, max=8)
-            ),
-            cv.Optional(CONF_DTU_ADDRESS, default=126): cv.int_range(min=1, max=254),  # DTU Modbus address
-            cv.Optional(CONF_POLL_INTERVAL_MS, default=5000): cv.int_range(min=1000),
-            cv.Optional(CONF_RTU_TIMEOUT_MS, default=3000): cv.int_range(min=100),
-            cv.Optional(CONF_AGGREGATE_SENSORS, default={}): AGGREGATE_SENSORS_SCHEMA,
-            cv.Optional(CONF_BRIDGE_SENSORS, default={}): BRIDGE_SENSORS_SCHEMA,
-        }
-    )
-    .extend(cv.COMPONENT_SCHEMA)
-    .extend(uart.UART_DEVICE_SCHEMA)
-)
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.declare_id(SunSpecProxy),
+        cv.Required(CONF_DTU_HOST): cv.string,
+        cv.Optional(CONF_DTU_PORT, default=502): cv.port,
+        cv.Optional(CONF_DTU_ADDRESS, default=101): cv.int_range(min=1, max=254),
+        cv.Optional(CONF_TCP_PORT, default=502): cv.port,
+        cv.Optional(CONF_UNIT_ID, default=126): cv.int_range(min=1, max=247),
+        cv.Optional(CONF_PHASES, default=3): cv.int_range(min=1, max=3),
+        cv.Optional(CONF_RATED_VOLTAGE_V, default=230): cv.int_range(min=1),
+        cv.Optional(CONF_MANUFACTURER, default="Fronius"): cv.string,
+        cv.Optional(CONF_MODEL_NAME, default="Hoymiles Bridge"): cv.string,
+        cv.Optional(CONF_SERIAL_NUMBER, default="HM-BRIDGE-001"): cv.string,
+        cv.Required(CONF_RTU_SOURCES): cv.All(
+            cv.ensure_list(RTU_SOURCE_SCHEMA), cv.Length(min=1, max=8)
+        ),
+        cv.Optional(CONF_POLL_INTERVAL_MS, default=5000): cv.int_range(min=1000),
+        cv.Optional(CONF_TCP_TIMEOUT_MS, default=3000): cv.int_range(min=100),
+        cv.Optional(CONF_AGGREGATE_SENSORS, default={}): AGGREGATE_SENSORS_SCHEMA,
+        cv.Optional(CONF_BRIDGE_SENSORS, default={}): BRIDGE_SENSORS_SCHEMA,
+    }
+).extend(cv.COMPONENT_SCHEMA)
 
 
 def get_model_specs(model_name):
@@ -297,18 +299,19 @@ async def _create_text_sensor(name, icon=None, entity_category=None):
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
-    await uart.register_uart_device(var, config)
 
+    cg.add(var.set_dtu_host(config[CONF_DTU_HOST]))
+    cg.add(var.set_dtu_port(config[CONF_DTU_PORT]))
+    cg.add(var.set_dtu_address(config[CONF_DTU_ADDRESS]))
     cg.add(var.set_tcp_port(config[CONF_TCP_PORT]))
     cg.add(var.set_unit_id(config[CONF_UNIT_ID]))
-    cg.add(var.set_dtu_address(config[CONF_DTU_ADDRESS]))
     cg.add(var.set_phases(config[CONF_PHASES]))
     cg.add(var.set_rated_voltage(config[CONF_RATED_VOLTAGE_V]))
     cg.add(var.set_manufacturer(config[CONF_MANUFACTURER]))
     cg.add(var.set_model_name(config[CONF_MODEL_NAME]))
     cg.add(var.set_serial_number(config[CONF_SERIAL_NUMBER]))
     cg.add(var.set_poll_interval_ms(config[CONF_POLL_INTERVAL_MS]))
-    cg.add(var.set_rtu_timeout_ms(config[CONF_RTU_TIMEOUT_MS]))
+    cg.add(var.set_tcp_timeout_ms(config[CONF_TCP_TIMEOUT_MS]))
 
     # Process RTU sources (inverter ports on the DTU)
     for idx, src in enumerate(config[CONF_RTU_SOURCES]):
@@ -414,6 +417,48 @@ async def to_code(config):
 
         sens = await _create_sensor(f"{name} Poll Failures", None, 0, None, None, "mdi:alert-circle", ENTITY_CATEGORY_DIAGNOSTIC)
         cg.add(var.set_source_poll_fail_sensor(idx, sens))
+
+        # Per-MPPT sensors if enabled
+        if sensor_config.get(CONF_MPPT_SENSORS, False):
+            for mppt_idx in range(mppt_inputs):
+                mppt_num = mppt_idx + 1
+                mppt_name = f"{name} MPPT{mppt_num}"
+                
+                # DC voltage
+                sens = await _create_sensor(f"{mppt_name} DC Voltage", UNIT_VOLT, 1, DEVICE_CLASS_VOLTAGE, STATE_CLASS_MEASUREMENT)
+                cg.add(var.set_mppt_dc_voltage_sensor(idx, mppt_idx, sens))
+                
+                # DC current
+                sens = await _create_sensor(f"{mppt_name} DC Current", UNIT_AMPERE, 2, DEVICE_CLASS_CURRENT, STATE_CLASS_MEASUREMENT)
+                cg.add(var.set_mppt_dc_current_sensor(idx, mppt_idx, sens))
+                
+                # DC power
+                sens = await _create_sensor(f"{mppt_name} DC Power", UNIT_WATT, 0, DEVICE_CLASS_POWER, STATE_CLASS_MEASUREMENT)
+                cg.add(var.set_mppt_dc_power_sensor(idx, mppt_idx, sens))
+                
+                # AC voltage
+                sens = await _create_sensor(f"{mppt_name} AC Voltage", UNIT_VOLT, 1, DEVICE_CLASS_VOLTAGE, STATE_CLASS_MEASUREMENT)
+                cg.add(var.set_mppt_ac_voltage_sensor(idx, mppt_idx, sens))
+                
+                # Frequency
+                sens = await _create_sensor(f"{mppt_name} Frequency", UNIT_HERTZ, 2, DEVICE_CLASS_FREQUENCY, STATE_CLASS_MEASUREMENT)
+                cg.add(var.set_mppt_frequency_sensor(idx, mppt_idx, sens))
+                
+                # Power
+                sens = await _create_sensor(f"{mppt_name} Power", UNIT_WATT, 0, DEVICE_CLASS_POWER, STATE_CLASS_MEASUREMENT)
+                cg.add(var.set_mppt_power_sensor(idx, mppt_idx, sens))
+                
+                # Today energy
+                sens = await _create_sensor(f"{mppt_name} Today Energy", "Wh", 0, DEVICE_CLASS_ENERGY, STATE_CLASS_TOTAL_INCREASING)
+                cg.add(var.set_mppt_today_energy_sensor(idx, mppt_idx, sens))
+                
+                # Total energy
+                sens = await _create_sensor(f"{mppt_name} Total Energy", UNIT_KILOWATT_HOURS, 1, DEVICE_CLASS_ENERGY, STATE_CLASS_TOTAL_INCREASING)
+                cg.add(var.set_mppt_total_energy_sensor(idx, mppt_idx, sens))
+                
+                # Temperature
+                sens = await _create_sensor(f"{mppt_name} Temperature", UNIT_CELSIUS, 1, DEVICE_CLASS_TEMPERATURE, STATE_CLASS_MEASUREMENT)
+                cg.add(var.set_mppt_temperature_sensor(idx, mppt_idx, sens))
 
     # Aggregate sensors
     agg_config = config.get(CONF_AGGREGATE_SENSORS, {})

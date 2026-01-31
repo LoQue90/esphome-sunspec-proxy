@@ -1,7 +1,6 @@
 #pragma once
 
 #include "esphome/core/component.h"
-#include "esphome/components/uart/uart.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
@@ -16,45 +15,33 @@ namespace sunspec_proxy {
 // SunSpec register base (0-based Modbus address) - for serving to Victron
 static const uint16_t SUNSPEC_BASE = 40000;
 
-// Hoymiles Modbus RTU register map (for polling DTU-Pro)
-// IMPORTANT: Hoymiles spec uses BYTE addresses, but Modbus FC 0x03 uses REGISTER addresses
-// Conversion: Modbus_Register_Address = Byte_Address (since spec starts at 0x1000 bytes = 0x1000 registers)
-// Port stride: 0x28 bytes = 40 decimal = 20 Modbus registers
-static const uint16_t HM_DATA_BASE = 0x1000;       // Port 0 data start (Modbus register address)
-static const uint16_t HM_PORT_STRIDE = 0x28;       // 40 bytes = 20 registers per port
-static const uint16_t HM_STATUS_BASE = 0xC000;     // Status registers (use FC 0x01/0x02, not FC 0x03!)
-static const uint16_t HM_DEVICE_SN_BASE = 0x2000;  // Device serial number base (FC 0x03)
+// Hoymiles DTU-Pro Modbus TCP register map
+// NEW LAYOUT: Per-MPPT-channel data at 0x4000, 25 registers per channel
+// 8 channels total (2 inverters × 4 MPPT each) = 200 registers
+static const uint16_t HM_DATA_BASE = 0x4000;       // MPPT channel data start
+static const uint16_t HM_MPPT_STRIDE = 25;         // 25 registers per MPPT channel
+static const uint16_t HM_MAX_CHANNELS = 8;         // Max MPPT channels to read
+static const uint16_t HM_TOTAL_REGS = 200;         // Total registers to read (8 × 25)
 
-// Hoymiles data register offsets (relative to port base)
-// These are REGISTER offsets, derived from byte addresses in spec:
-// Byte 0x1008 → Register (0x1008-0x1000)/2 = 4, etc.
-// 
-// Spec's "decimal" column: 1 = ×0.1 (divide by 10), 2 = ×0.01 (divide by 100)
-// Layout per port (20 registers):
-// Reg 0: [data_type(u8)][serial_byte_0(u8)]
-// Reg 1-2: serial bytes 1-4
-// Reg 3: [serial_byte_5(u8)][port_number(u8)]
-// Reg 4-16: live data (voltage, current, power, energy, temp, status, alarms)
-// Reg 17-19: reserved
-static const uint16_t HM_DATA_TYPE_SN = 0x00;      // Reg 0: [data_type(u8)][serial_byte_0]
-static const uint16_t HM_SN_REG1 = 0x01;           // Reg 1-2: serial bytes 1-4
-static const uint16_t HM_SN_PORT = 0x03;           // Reg 3: [serial_byte_5][port_number(u8)]
-static const uint16_t HM_PV_VOLTAGE = 0x04;        // PV voltage (×0.1 → V)
-static const uint16_t HM_PV_CURRENT = 0x05;        // PV current (×0.01 → A for HM/HMS)
-static const uint16_t HM_GRID_VOLTAGE = 0x06;      // Grid voltage (×0.1 → V)
-static const uint16_t HM_GRID_FREQ = 0x07;         // Grid frequency (×0.01 → Hz)
-static const uint16_t HM_PV_POWER = 0x08;          // PV power (×0.1 → W)
-static const uint16_t HM_TODAY_PROD = 0x09;        // Today production (raw Wh, uint16)
-static const uint16_t HM_TOTAL_PROD_H = 0x0A;      // Total production high word (uint32 Wh, no scaling)
-static const uint16_t HM_TOTAL_PROD_L = 0x0B;      // Total production low word
-static const uint16_t HM_TEMPERATURE = 0x0C;       // Temperature (×0.1 → °C, int16)
-static const uint16_t HM_OPERATING_STATUS = 0x0D;  // Operating status (uint16)
-static const uint16_t HM_ALARM_CODE = 0x0E;        // Alarm code (uint16)
-static const uint16_t HM_ALARM_COUNT = 0x0F;       // Alarm count (uint16)
-static const uint16_t HM_LINK_STATUS = 0x10;       // Link status in high byte (uint8)
-static const uint16_t HM_PORT_REGS = 20;           // Only 20 registers contain actual data
-static const uint16_t HM_DTU_SN_BASE = 0x2000;     // DTU serial number base address (3 regs = 6 bytes)
-static const uint16_t HM_DTU_SN_REGS = 3;          // Number of registers for DTU serial
+// Per-MPPT register offsets (relative to channel base at 0x4000 + channel×25)
+// Verified register layout from live DTU-Pro testing:
+// Each MPPT channel uses 25 registers, indexed [0..24]:
+static const uint16_t HM_MARKER = 0;               // [0] = 12 (marker/type)
+static const uint16_t HM_INV_SN_1 = 1;             // [1:3] = Inverter SN (3 regs, 6 bytes hex)
+static const uint16_t HM_INV_SN_2 = 2;
+static const uint16_t HM_INV_SN_3 = 3;
+static const uint16_t HM_MPPT_NUM = 4;             // [4] = MPPT channel number (1-based)
+static const uint16_t HM_DC_VOLTAGE = 5;           // [5] = DC voltage × 10 (÷10 for volts)
+static const uint16_t HM_DC_CURRENT = 6;           // [6] = DC current × 10 (÷100 for amps: raw/100)
+static const uint16_t HM_AC_VOLTAGE = 7;           // [7] = AC voltage × 10 (÷10 for volts)
+static const uint16_t HM_FREQUENCY = 8;            // [8] = Frequency × 100 (÷100 for Hz)
+static const uint16_t HM_POWER = 9;                // [9] = Power × 10 (÷10 for watts)
+static const uint16_t HM_TODAY_ENERGY = 10;        // [10] = Energy today (Wh, raw)
+static const uint16_t HM_TOTAL_ENERGY_H = 11;      // [11] = Total energy high word
+static const uint16_t HM_TOTAL_ENERGY_L = 12;      // [12] = Total energy low word
+static const uint16_t HM_TEMPERATURE = 13;         // [13] = Temperature × 10 (÷10 for °C)
+static const uint16_t HM_STATUS = 14;              // [14] = Status (3 = producing)
+// [15:24] = Reserved/unknown
 
 // Model sizes (register count)
 static const uint16_t MODEL_1_SIZE = 66;    // Common
@@ -111,35 +98,52 @@ static const uint16_t INV_EvtVnd4 = 48;// Vendor event 4
 
 // Max TCP clients
 static const int MAX_TCP_CLIENTS = 4;
-// Max RTU sources (physical inverters polled via RS-485)
+// Max RTU sources (physical inverters)
 static const int MAX_RTU_SOURCES = 8;
+// Max MPPT channels per inverter
+static const int MAX_MPPT_PER_INVERTER = 8;
 
-// An RTU source is a physical Hoymiles inverter connected to a DTU port
-// Data is read from the DTU using Hoymiles Modbus registers (0x1000 + port*40)
+// Per-MPPT channel data (from DTU-Pro register 0x4000 + channel×25)
+struct MpptData {
+  uint8_t mppt_num;         // MPPT number (1-based) from register
+  bool data_valid;          // Is this data populated?
+  
+  // Decoded values from registers (real-world units)
+  float dc_voltage_v;       // [5] ÷ 10
+  float dc_current_a;       // [6] ÷ 100
+  float ac_voltage_v;       // [7] ÷ 10
+  float frequency_hz;       // [8] ÷ 100
+  float power_w;            // [9] ÷ 10
+  float today_energy_wh;    // [10] raw
+  float total_energy_kwh;   // [11:12] as uint32 Wh ÷ 1000
+  float temperature_c;      // [13] ÷ 10
+  uint16_t status;          // [14] (3 = producing)
+};
+
+// An RTU source is a physical Hoymiles inverter
+// Data is read from the DTU-Pro via Modbus TCP at 0x4000 (per-MPPT layout)
 struct RtuSource {
-  uint8_t port_number;       // DTU port number (0, 1, 2... for each inverter)
+  uint8_t port_number;       // Legacy field (not used in TCP mode)
   uint8_t phases;            // 1 or 3
   uint8_t connected_phase;   // For single-phase: which grid phase (1=L1, 2=L2, 3=L3)
   uint16_t rated_power_w;    // Rated output power in watts
   uint8_t mppt_inputs;       // Number of MPPT inputs (DC strings)
   char name[32];             // Friendly name for logging/sensors
   char model[24];            // Inverter model (e.g., "HMS-2000-4T")
-  char serial_number[33];    // Inverter serial (configured or auto-read)
-  char serial_from_dtu[33];  // Serial read from DTU (auto-populated)
-
-  // Raw register block from last poll (50 regs for Model 101/103 data area)
-  uint16_t raw_regs[MODEL_103_SIZE];
+  char serial_number[33];    // Inverter serial (hex string, e.g., "1520a025566b")
+  
+  // Per-MPPT data (populated by matching SN from register 0x4000+ data)
+  MpptData mppt[MAX_MPPT_PER_INVERTER];
+  uint8_t mppt_count;        // How many MPPT channels are populated
+  
   bool data_valid;
   uint32_t last_poll_ms;
-  bool initial_model1_read;  // Have we read Model 1 (serial) yet?
 
   // Statistics
   uint32_t poll_success_count;
   uint32_t poll_fail_count;
-  uint32_t poll_timeout_count;
-  uint32_t crc_error_count;
 
-  // Decoded values in real-world units (for sensors)
+  // Aggregated values for this inverter (sum/avg of all MPPTs)
   float power_w;
   float current_a;
   float voltage_v;
@@ -169,16 +173,18 @@ struct AggregatedConfig {
   char serial_number[32];   // e.g. "HM-BRIDGE-001"
 };
 
-class SunSpecProxy : public Component, public uart::UARTDevice {
+class SunSpecProxy : public Component {
  public:
   void setup() override;
   void loop() override;
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
 
+  void set_dtu_host(const std::string &host) { dtu_host_ = host; }
+  void set_dtu_port(uint16_t port) { dtu_port_ = port; }
+  void set_dtu_address(uint8_t addr) { dtu_address_ = addr; }
   void set_tcp_port(uint16_t port) { tcp_port_ = port; }
   void set_poll_interval_ms(uint32_t ms) { poll_interval_ms_ = ms; }
-  void set_rtu_timeout_ms(uint32_t ms) { rtu_timeout_ms_ = ms; }
-  void set_dtu_address(uint8_t addr) { dtu_address_ = addr; }
+  void set_tcp_timeout_ms(uint32_t ms) { tcp_timeout_ms_ = ms; }
 
   // Aggregated device identity
   void set_unit_id(uint8_t id) { agg_config_.unit_id = id; }
@@ -213,6 +219,44 @@ class SunSpecProxy : public Component, public uart::UARTDevice {
   void set_source_online_sensor(int idx, binary_sensor::BinarySensor *s) { if (idx < MAX_RTU_SOURCES) src_online_sensors_[idx] = s; }
   void set_source_status_sensor(int idx, text_sensor::TextSensor *s) { if (idx < MAX_RTU_SOURCES) src_status_sensors_[idx] = s; }
 
+  // --- Per-MPPT sensor setters ---
+  void set_mppt_dc_voltage_sensor(int inv_idx, int mppt_idx, sensor::Sensor *s) { 
+    if (inv_idx < MAX_RTU_SOURCES && mppt_idx < MAX_MPPT_PER_INVERTER) 
+      mppt_dc_voltage_sensors_[inv_idx][mppt_idx] = s; 
+  }
+  void set_mppt_dc_current_sensor(int inv_idx, int mppt_idx, sensor::Sensor *s) { 
+    if (inv_idx < MAX_RTU_SOURCES && mppt_idx < MAX_MPPT_PER_INVERTER) 
+      mppt_dc_current_sensors_[inv_idx][mppt_idx] = s; 
+  }
+  void set_mppt_dc_power_sensor(int inv_idx, int mppt_idx, sensor::Sensor *s) { 
+    if (inv_idx < MAX_RTU_SOURCES && mppt_idx < MAX_MPPT_PER_INVERTER) 
+      mppt_dc_power_sensors_[inv_idx][mppt_idx] = s; 
+  }
+  void set_mppt_ac_voltage_sensor(int inv_idx, int mppt_idx, sensor::Sensor *s) { 
+    if (inv_idx < MAX_RTU_SOURCES && mppt_idx < MAX_MPPT_PER_INVERTER) 
+      mppt_ac_voltage_sensors_[inv_idx][mppt_idx] = s; 
+  }
+  void set_mppt_frequency_sensor(int inv_idx, int mppt_idx, sensor::Sensor *s) { 
+    if (inv_idx < MAX_RTU_SOURCES && mppt_idx < MAX_MPPT_PER_INVERTER) 
+      mppt_frequency_sensors_[inv_idx][mppt_idx] = s; 
+  }
+  void set_mppt_power_sensor(int inv_idx, int mppt_idx, sensor::Sensor *s) { 
+    if (inv_idx < MAX_RTU_SOURCES && mppt_idx < MAX_MPPT_PER_INVERTER) 
+      mppt_power_sensors_[inv_idx][mppt_idx] = s; 
+  }
+  void set_mppt_today_energy_sensor(int inv_idx, int mppt_idx, sensor::Sensor *s) { 
+    if (inv_idx < MAX_RTU_SOURCES && mppt_idx < MAX_MPPT_PER_INVERTER) 
+      mppt_today_energy_sensors_[inv_idx][mppt_idx] = s; 
+  }
+  void set_mppt_total_energy_sensor(int inv_idx, int mppt_idx, sensor::Sensor *s) { 
+    if (inv_idx < MAX_RTU_SOURCES && mppt_idx < MAX_MPPT_PER_INVERTER) 
+      mppt_total_energy_sensors_[inv_idx][mppt_idx] = s; 
+  }
+  void set_mppt_temperature_sensor(int inv_idx, int mppt_idx, sensor::Sensor *s) { 
+    if (inv_idx < MAX_RTU_SOURCES && mppt_idx < MAX_MPPT_PER_INVERTER) 
+      mppt_temperature_sensors_[inv_idx][mppt_idx] = s; 
+  }
+
   // --- Aggregate sensors ---
   void set_agg_power_sensor(sensor::Sensor *s) { agg_power_sensor_ = s; }
   void set_agg_voltage_sensor(sensor::Sensor *s) { agg_voltage_sensor_ = s; }
@@ -235,7 +279,7 @@ class SunSpecProxy : public Component, public uart::UARTDevice {
   void set_dtu_online_sensor(binary_sensor::BinarySensor *s) { dtu_online_sensor_ = s; }
 
  protected:
-  // TCP server
+  // TCP server (for Victron)
   void setup_tcp_server_();
   void handle_tcp_clients_();
   void process_tcp_request_(int client_fd, uint8_t *buf, int len);
@@ -244,11 +288,13 @@ class SunSpecProxy : public Component, public uart::UARTDevice {
   void send_tcp_error_(int client_fd, uint16_t transaction_id, uint8_t unit_id,
                        uint8_t function_code, uint8_t error_code);
 
-  // RTU master
-  void poll_rtu_sources_();
-  bool send_rtu_request_(uint8_t address, uint8_t function, uint16_t reg_start, uint16_t reg_count);
-  int read_rtu_response_(uint8_t *buf, int max_len);
-  uint16_t calc_crc16_(const uint8_t *data, uint16_t len);
+  // Modbus TCP client (to DTU-Pro)
+  void setup_dtu_client_();
+  void poll_dtu_data_();
+  bool connect_to_dtu_();
+  void close_dtu_connection_();
+  bool send_modbus_tcp_request_(uint8_t function, uint16_t reg_start, uint16_t reg_count);
+  int read_modbus_tcp_response_(uint8_t *buf, int max_len);
 
   // SunSpec register handling
   bool read_sunspec_registers_(uint16_t start_reg, uint16_t count, uint16_t *out);
@@ -259,8 +305,14 @@ class SunSpecProxy : public Component, public uart::UARTDevice {
   // Forward power limit to all RTU sources
   void forward_power_limit_(uint16_t pct_raw, bool enabled);
 
+  // Data parsing and mapping
+  void parse_dtu_registers_(const uint16_t *regs, int reg_count);
+  void map_mppt_to_inverters_();
+  void aggregate_inverter_data_(int inv_idx);
+  
   // Sensor publishing
   void publish_source_sensors_(int idx);
+  void publish_mppt_sensors_(int inv_idx, int mppt_idx);
   void publish_aggregate_sensors_();
   void publish_tcp_sensors_();
   void update_source_status_(int idx);
@@ -268,10 +320,12 @@ class SunSpecProxy : public Component, public uart::UARTDevice {
   static const uint32_t SENSOR_PUBLISH_INTERVAL_MS = 5000;
 
   // Config
-  uint16_t tcp_port_{502};
+  std::string dtu_host_;       // DTU-Pro IP/hostname
+  uint16_t dtu_port_{502};     // DTU-Pro Modbus TCP port
+  uint8_t dtu_address_{101};   // DTU Modbus unit ID
+  uint16_t tcp_port_{502};     // SunSpec server port (for Victron)
   uint32_t poll_interval_ms_{5000};
-  uint32_t rtu_timeout_ms_{3000};
-  uint8_t dtu_address_{126};  // Modbus address of DTU-Pro
+  uint32_t tcp_timeout_ms_{3000};
 
   // Aggregated device config
   AggregatedConfig agg_config_{};
@@ -287,12 +341,16 @@ class SunSpecProxy : public Component, public uart::UARTDevice {
   uint32_t tcp_error_count_{0};
   uint32_t last_tcp_activity_ms_{0};
 
-  // RTU polling state
-  int current_poll_source_{0};
-  int current_poll_phase_{0}; // -1=DTU serial read, 0=inverter data
+  // DTU client state
+  int dtu_fd_{-1};             // DTU connection socket
   uint32_t last_poll_time_{0};
-  bool rtu_busy_{false};
-  uint32_t rtu_request_time_{0};
+  uint32_t last_dtu_connect_attempt_{0};
+  uint16_t modbus_transaction_id_{1};
+  bool dtu_connected_{false};
+  
+  // Raw register buffer from DTU (200 registers = 8 channels × 25)
+  uint16_t dtu_regs_[HM_TOTAL_REGS];
+  bool dtu_data_valid_{false};
 
   // Single register map for the aggregated device
   static const uint16_t OFF_SUNS = 0;
@@ -348,8 +406,6 @@ class SunSpecProxy : public Component, public uart::UARTDevice {
   sensor::Sensor *power_limit_sensor_{nullptr};
 
   // DTU diagnostics
-  char dtu_serial_[13]{};                // DTU serial number (hex string)
-  bool dtu_serial_read_{false};          // Have we read the DTU serial?
   uint32_t dtu_poll_count_{0};           // Successful DTU polls
   uint32_t dtu_poll_fail_count_{0};      // Failed DTU polls
   uint32_t last_dtu_poll_ok_ms_{0};      // Timestamp of last successful DTU poll
@@ -357,6 +413,17 @@ class SunSpecProxy : public Component, public uart::UARTDevice {
   sensor::Sensor *dtu_poll_ok_sensor_{nullptr};
   sensor::Sensor *dtu_poll_fail_sensor_{nullptr};
   binary_sensor::BinarySensor *dtu_online_sensor_{nullptr};
+
+  // Per-MPPT sensor arrays [inverter_idx][mppt_idx]
+  sensor::Sensor *mppt_dc_voltage_sensors_[MAX_RTU_SOURCES][MAX_MPPT_PER_INVERTER]{};
+  sensor::Sensor *mppt_dc_current_sensors_[MAX_RTU_SOURCES][MAX_MPPT_PER_INVERTER]{};
+  sensor::Sensor *mppt_dc_power_sensors_[MAX_RTU_SOURCES][MAX_MPPT_PER_INVERTER]{};
+  sensor::Sensor *mppt_ac_voltage_sensors_[MAX_RTU_SOURCES][MAX_MPPT_PER_INVERTER]{};
+  sensor::Sensor *mppt_frequency_sensors_[MAX_RTU_SOURCES][MAX_MPPT_PER_INVERTER]{};
+  sensor::Sensor *mppt_power_sensors_[MAX_RTU_SOURCES][MAX_MPPT_PER_INVERTER]{};
+  sensor::Sensor *mppt_today_energy_sensors_[MAX_RTU_SOURCES][MAX_MPPT_PER_INVERTER]{};
+  sensor::Sensor *mppt_total_energy_sensors_[MAX_RTU_SOURCES][MAX_MPPT_PER_INVERTER]{};
+  sensor::Sensor *mppt_temperature_sensors_[MAX_RTU_SOURCES][MAX_MPPT_PER_INVERTER]{};
 };
 
 }  // namespace sunspec_proxy

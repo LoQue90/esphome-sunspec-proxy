@@ -1,12 +1,7 @@
-# ESPHome build artifacts
-.esphome/
+# Gitignore settings for ESPHome
+/.esphome/
+/secrets.yaml
+/waveshare-rs485.yaml
 __pycache__/
 *.pyc
-
-# Secrets (contains WiFi passwords, etc.)
-secrets.yaml
-secrets/
-
-# IDE
-.vscode/
-.idea/
+TCP_MIGRATION_COMPLETE.md
