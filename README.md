@@ -93,6 +93,45 @@ Data is read from register `0x4000` with a stride of 25 registers per MPPT chann
 | 13 | Temperature | ÷10 → °C |
 | 14 | Status | 3=producing |
 
+## Power Limiting / Victron ESS Integration
+
+The proxy supports **bidirectional** communication with Victron ESS systems via SunSpec Model 123 (Immediate Controls).
+
+When Victron requests a power limit (e.g., during battery-full conditions or grid export limits), the proxy:
+
+1. Receives power limit via SunSpec Model 123 register writes (WMaxLimPct, WMaxLim_Ena)
+2. Converts percentage to Hoymiles format (2-100 for HM series)
+3. Forwards limit to each inverter via Modbus TCP FC 0x05 writes to DTU control registers
+
+### Control Register Map
+
+Control commands use **FC 0x05 (Write Single Coil)** but with **raw values** (not standard 0xFF00/0x0000).
+
+| Address | Function | Values | Notes |
+|---------|----------|--------|-------|
+| 0xC000 | All inverters ON/OFF | 0=OFF, 1=ON | Global control |
+| 0xC001 | All inverters limit % | 2-100 | HM series min=2% |
+| 0xC006 | Port 0 ON/OFF | 0=OFF, 1=ON | First inverter |
+| 0xC007 | Port 0 limit % | 2-100 | First inverter |
+| 0xC00C | Port 1 ON/OFF | 0=OFF, 1=ON | Second inverter |
+| 0xC00D | Port 1 limit % | 2-100 | Second inverter |
+
+**Pattern:** Each inverter port has base address `0xC006 + port×6` (ON/OFF) and `0xC007 + port×6` (limit %).
+
+**Example:** To limit Port 0 to 50%:
+1. Write `50` to `0xC007` (FC 0x05)
+2. Write `1` to `0xC006` (FC 0x05) to ensure inverter is ON
+
+**To remove limit:** Write `100` to `0xC007 + port×6`
+
+### Victron ESS Behavior
+
+- When battery full or grid limit reached, Victron writes WMaxLimPct (e.g., 50.0% = value 500)
+- When limit removed, Victron writes WMaxLim_Ena = 0 or WMaxLimPct = 100.0%
+- Proxy converts SunSpec units (tenths of percent, 0-1000) to Hoymiles raw percentage (2-100)
+
+**Note:** Some Hoymiles models (MI series) have a minimum limit of 10% instead of 2%. Check your inverter specs.
+
 ## License
 
 MIT

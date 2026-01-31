@@ -304,6 +304,9 @@ class SunSpecProxy : public Component {
 
   // Forward power limit to all RTU sources
   void forward_power_limit_(uint16_t pct_raw, bool enabled);
+  
+  // Modbus TCP FC 0x05 helper (Write Single Coil with raw value)
+  bool send_dtu_fc05_(uint16_t address, uint16_t value);
 
   // Data parsing and mapping
   void parse_dtu_registers_(const uint16_t *regs, int reg_count);

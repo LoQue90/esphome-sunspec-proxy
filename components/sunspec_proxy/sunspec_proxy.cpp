@@ -722,20 +722,113 @@ bool SunSpecProxy::write_sunspec_registers_(uint16_t start_reg, uint16_t count, 
 // Power Limit Forwarding
 // ============================================================
 
-void SunSpecProxy::forward_power_limit_(uint16_t pct_raw, bool enabled) {
-  // TODO: Implement power limit forwarding via Modbus TCP
-  // DTU-Pro control register mapping for TCP mode needs to be tested
-  // For now, just log the command
-  
-  float pct = pct_raw / 10.0f;
-  if (enabled) {
-    ESP_LOGI(TAG, "VICTRON: Power limit command received: %.1f%% (forwarding not yet implemented in TCP mode)", pct);
-  } else {
-    ESP_LOGI(TAG, "VICTRON: Power limit removed (forwarding not yet implemented in TCP mode)");
+bool SunSpecProxy::send_dtu_fc05_(uint16_t address, uint16_t value) {
+  if (!dtu_connected_ && !connect_to_dtu_()) {
+    ESP_LOGW(TAG, "DTU FC05: Not connected");
+    return false;
   }
   
-  // Note: The DTU-Pro control registers (0xC000 series) may work differently over TCP
-  // than they did over RTU. This needs testing with the actual DTU before implementing.
+  // Build Modbus TCP FC 0x05 frame
+  // MBAP Header: transaction_id(2) + protocol_id(2,=0) + length(2,=6) + unit_id(1)
+  // PDU: function_code(1,=0x05) + register_address(2) + value(2)
+  uint8_t frame[12];
+  put_be16(&frame[0], modbus_transaction_id_);
+  put_be16(&frame[2], 0);  // Protocol ID = 0
+  put_be16(&frame[4], 6);  // Length = 6 (unit_id + function + address + value)
+  frame[6] = dtu_address_;
+  frame[7] = 0x05;  // FC 0x05 (Write Single Coil)
+  put_be16(&frame[8], address);
+  put_be16(&frame[10], value);
+  
+  int sent = send(dtu_fd_, frame, 12, 0);
+  if (sent != 12) {
+    ESP_LOGW(TAG, "DTU FC05: Send failed (%d bytes, errno=%d)", sent, errno);
+    close_dtu_connection_();
+    return false;
+  }
+  
+  modbus_transaction_id_++;
+  
+  // Read response (should echo back the same frame)
+  uint8_t resp[12];
+  int n = read_modbus_tcp_response_(resp, sizeof(resp));
+  if (n < 12) {
+    ESP_LOGW(TAG, "DTU FC05: Invalid response length: %d", n);
+    return false;
+  }
+  
+  // Validate response
+  uint16_t resp_addr = be16(&resp[8]);
+  uint16_t resp_val = be16(&resp[10]);
+  if (resp[7] != 0x05 || resp_addr != address || resp_val != value) {
+    ESP_LOGW(TAG, "DTU FC05: Response mismatch (fc=0x%02X, addr=0x%04X, val=0x%04X)", 
+             resp[7], resp_addr, resp_val);
+    return false;
+  }
+  
+  ESP_LOGD(TAG, "DTU FC05: Write 0x%04X = %d OK", address, value);
+  return true;
+}
+
+void SunSpecProxy::forward_power_limit_(uint16_t pct_raw, bool enabled) {
+  // Convert SunSpec percentage (0-1000 = 0-100.0%) to Hoymiles percentage
+  // SunSpec: 1000 = 100.0%, pct_raw is in tenths of percent
+  // Hoymiles: 2-100 for HM series, 10-100 for MI series (raw value)
+  
+  float pct_f = pct_raw / 10.0f;  // Convert to actual percentage
+  uint16_t hm_limit = 100;  // Default = no limit
+  
+  if (enabled && pct_f < 100.0f) {
+    // Clamp to valid Hoymiles range (use 2-100 for HM series)
+    hm_limit = (uint16_t)pct_f;
+    if (hm_limit < 2) hm_limit = 2;
+    if (hm_limit > 100) hm_limit = 100;
+  }
+  
+  ESP_LOGI(TAG, "VICTRON: Power limit command — %.1f%% → Hoymiles %d%%, enabled=%d", 
+           pct_f, hm_limit, enabled);
+  
+  // Control register map (from testing):
+  // 0xC000 = All inverters ON/OFF (FC 0x05, value 0=OFF, 1=ON)
+  // 0xC001 = All inverters limit % (FC 0x05, value 2-100)
+  // 0xC006 + port*6 = Port N ON/OFF
+  // 0xC007 + port*6 = Port N limit %
+  
+  bool success = true;
+  
+  // Apply to each inverter port
+  for (int i = 0; i < num_sources_; i++) {
+    auto &inv = sources_[i];
+    uint8_t port = inv.port_number;
+    
+    // Calculate port-specific register addresses
+    uint16_t port_limit_reg = 0xC007 + (port * 6);
+    uint16_t port_on_reg = 0xC006 + (port * 6);
+    
+    ESP_LOGI(TAG, "  Port %d (%s): Setting limit to %d%%", port, inv.name, hm_limit);
+    
+    // Step 1: Write limit percentage
+    if (!send_dtu_fc05_(port_limit_reg, hm_limit)) {
+      ESP_LOGW(TAG, "  Port %d: Failed to set limit", port);
+      success = false;
+      continue;
+    }
+    
+    // Step 2: If enabled (not 100%), ensure inverter is ON
+    // If disabled (100%), we just set limit to 100% and leave it running
+    if (enabled && hm_limit < 100) {
+      if (!send_dtu_fc05_(port_on_reg, 1)) {
+        ESP_LOGW(TAG, "  Port %d: Failed to enable", port);
+        success = false;
+      }
+    }
+  }
+  
+  if (success) {
+    ESP_LOGI(TAG, "VICTRON: Power limit forwarded successfully to %d ports", num_sources_);
+  } else {
+    ESP_LOGW(TAG, "VICTRON: Power limit forwarding had errors");
+  }
 }
 
 // ============================================================
