@@ -132,6 +132,41 @@ Control commands use **FC 0x05 (Write Single Coil)** but with **raw values** (no
 
 **Note:** Some Hoymiles models (MI series) have a minimum limit of 10% instead of 2%. Check your inverter specs.
 
+## Future: W-Series Inverter Support (Integral DTU)
+
+Hoymiles inverters with built-in WiFi DTU (model names containing **W**, e.g. HMS-800W-2T, HMS-2000DW-4T) use a **completely different local protocol** from the DTU-Pro. They are not supported by OpenDTU or AhoyDTU.
+
+### Protocol Differences
+
+| | DTU-Pro (current) | W-Series Integral DTU |
+|---|---|---|
+| **Port** | 502 (Modbus TCP) | 10081 (proprietary) |
+| **Protocol** | Modbus registers (FC 0x03/0x05) | Protobuf over TCP |
+| **Data format** | Register arrays, stride 25 | Protobuf messages (RealDataReqDTO) |
+| **Power control** | FC 0x05 to 0xC000+ | Protobuf CommandPB (action 8) |
+| **Auth** | None | Optional encryption (newer firmware) |
+
+### Reference Implementation
+
+The [suaveolent/hoymiles-wifi](https://github.com/suaveolent/hoymiles-wifi) Python library has reverse-engineered the W-series protobuf protocol and supports:
+- HMS-400W-1T, HMS-800W-2T, HMS-1000W-2T, HMS-2000DW-4T
+- DTU-WLite, DTU-Pro(S) (which also speak protobuf on port 10081)
+- Hybrid inverters (HYS/HYT)
+- Power limiting, on/off control, config, firmware updates
+
+A Home Assistant integration is available at [suaveolent/ha-hoymiles-wifi](https://github.com/suaveolent/ha-hoymiles-wifi).
+
+### What Would Be Needed
+
+To add W-series support to this proxy:
+
+1. **Protobuf data source adapter** — Port the hoymiles-wifi protocol from Python to C++ (ESP-IDF has nanopb support, protobuf schemas are available in the Python library's `.proto` files)
+2. **Data normalisation layer** — Abstract inverter data into a common struct so the SunSpec server is source-agnostic
+3. **Power limit forwarding** — Replace Modbus FC 0x05 writes with protobuf `CMD_ACTION_LIMIT_POWER` commands
+4. **Encryption handling** — Newer W-series firmware encrypts the protobuf channel
+
+**Alternative approach:** Run the `hoymiles-wifi` Python library on a separate device (Pi, NAS, container) exposing data via MQTT or REST, then have the ESP32 proxy consume that. Less elegant but significantly faster to implement.
+
 ## License
 
 MIT
