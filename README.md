@@ -6,7 +6,7 @@ An ESPHome component that bridges Hoymiles microinverters to Victron energy syst
 
 ```
 ┌──────────────┐                    ┌─────────────┐
-│  Hoymiles    │◄──── 2.4GHz RF ───►│  DTU-Pro    │
+│  Hoymiles    │◄── Sub-GHz RF ────►│  DTU-Pro    │
 │  µ-inverters │                    │ Modbus TCP  │
 └──────────────┘                    └──────┬──────┘
                                            │ WiFi / LAN
@@ -42,7 +42,7 @@ The ESP32 connects to the DTU-Pro via Modbus TCP to read per-MPPT-channel data, 
 
 ## Supported Hardware
 
-- **ESP32-S3** (tested on Waveshare ESP32-S3-Relay-6CH)
+- **ESP32-S3** (tested on Waveshare ESP32-S3-ETH with RS-485)
 - **Hoymiles DTU-Pro** with Modbus TCP enabled
 - **Hoymiles inverters**: HMS, HMT, MIT series (1-8 MPPT inputs)
 
