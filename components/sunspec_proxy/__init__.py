@@ -88,6 +88,17 @@ SunSpecProxy = sunspec_proxy_ns.class_("SunSpecProxy", cg.Component)
 
 # Known Hoymiles inverter models with their characteristics
 HOYMILES_MODELS = {
+    # HM Single-phase microinverters - 1 MPPT
+    "HM-300": {"phases": 1, "mppt": 1, "power": 300},
+    "HM-350": {"phases": 1, "mppt": 1, "power": 350},
+    "HM-400": {"phases": 1, "mppt": 1, "power": 400}, 
+    # HM Single-phase microinverters - 2 MPPT
+    "HM-600": {"phases": 1, "mppt": 2, "power": 600},
+    "HM-700": {"phases": 1, "mppt": 2, "power": 700},
+    "HM-800": {"phases": 1, "mppt": 2, "power": 800},
+    # HM Single-phase microinverters - 4 MPPT
+    "HM-1200": {"phases": 1, "mppt": 4, "power": 1200},
+    "HM-1500": {"phases": 1, "mppt": 4, "power": 1500},
     # Single-phase microinverters (HMS series) - 1 MPPT
     "HMS-300-1T": {"phases": 1, "mppt": 1, "power": 300},
     "HMS-350-1T": {"phases": 1, "mppt": 1, "power": 350},
